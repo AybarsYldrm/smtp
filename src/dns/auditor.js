@@ -147,7 +147,8 @@ class DnsAuditor {
       else if (status === 'error') summary.error++;
 
       let applied = false;
-      if (apply && (status === 'missing' || status === 'drift') && this._canWrite()) {
+      const needsWrite = status === 'missing' || status === 'drift';
+      if (apply && needsWrite && this._canWrite()) {
         try {
           await this._applyRecord(record);
           applied = true;
@@ -156,6 +157,25 @@ class DnsAuditor {
         } catch (err) {
           this.logger.error({ type: record.type, name: record.name, error: err.message, msg: 'DNS kaydı yazılamadı' });
         }
+      } else if (needsWrite) {
+        // Sapan kaydın KENDİSİ yazılır, yalnızca sayısı değil.
+        //
+        // Önceki hâli "drift=2" deyip susuyordu; hangi kayıt, ne bekleniyor,
+        // ne bulundu — hiçbiri görünmüyordu. Bir DNS sapması elle
+        // düzeltilecekse okunması gereken tek şey bu üçlü. Neden
+        // yazılmadığını da söylüyoruz: çoğu zaman sebep bir hata değil,
+        // otomatik yazmanın kapalı olması.
+        summary.pending = (summary.pending || 0) + 1;
+        this.logger.warn({
+          type: record.type,
+          name: record.name,
+          expected: record.expected,
+          observed: values.join(' | ') || '(kayıt yok)',
+          reason: !apply
+            ? 'otomatik yazma kapalı (FITFAK_DNS_AUTO_APPLY=1 ile açılır)'
+            : 'sağlayıcı kimlik bilgileri eksik (CF_API_TOKEN ve CF_ZONE_ID)',
+          msg: `DNS kaydı ${status === 'missing' ? 'eksik' : 'sapmış'}`,
+        });
       }
 
       await this.stores.dnsAudit.record({

@@ -245,6 +245,41 @@ gönderen, `Reply-To` ve kutunun kendisi hedef listesinden çıkarılıyor; ayr�
 döndürdüğü için tarayıcı görüntülemiyordu. Ham ileti artık sayfada açılıyor;
 indirme ve panoya kopyalama ayrı düğmelerde.
 
+**15. Kasaya yazılan sır saniyeler sonra açılamıyordu** *(bildirilen hata)*
+
+Uzak (gRPC) sürücüde DKIM anahtarı yazıldıktan hemen sonra okunduğunda
+`Unsupported state or unable to authenticate data` veriyordu — yani hiçbir
+posta imzalanamıyor, hiçbir posta gönderilemiyordu. Anahtar doğru, veri
+sağlam, AAD aynıydı; değişen tek şey zarfın **türüydü**. Şema alanı `bytes`
+diyor ama bunun tel üzerindeki temsili sürücüye göre değişiyor: gömülü motor
+`Buffer`, gRPC/JSON köprüsü base64 dizge döndürüyor. Kod `Buffer.from(dizge)`
+diyordu ve bu, base64'ü çözmek yerine harflerini UTF-8 kodluyordu.
+
+Artık okurken bilinen bütün temsiller kabul ediliyor, yazarken zarf ayrıca
+base64 **dizge** olarak saklanıyor ve her yazma geri okunup doğrulanıyor.
+Son adım önemli: açılamayan bir sır, yazıldığı anda değil ilk posta
+gönderilirken fark ediliyordu.
+
+**16. Gmail'den gelen her iletide DKIM başarısızdı** *(bildirilen hata)*
+
+`h=` listesinde olup iletide bulunmayan başlık, imza girdisine hiçbir şey
+katmaz (RFC 6376 §3.5: "null input"). Kod onları boş bir `ad:` olarak
+ekliyordu. Kendi imzalarımızda tutarlıydı — aynı yanlışı iki tarafta da
+yapıyorduk — ama dış imzalayıcılarda tutmuyordu. Gmail "oversigning" yaptığı
+için (`h=` listesinde altı ad iki kez, `cc` ve `reply-to` hiç yok) her
+iletide tetikleniyordu. Kayıttaki *"gövde özeti doğru, imzalanan
+başlıklardan biri değişmiş"* tam olarak buydu.
+
+**17. Kapsam onayı sonsuz döngüye giriyordu** *(bildirilen hata)*
+
+Kullanıcı `cert:issue` iznini veriyor, IdP geri yönlendiriyor, jeton takas
+ediliyor — ve sertifika isteği yine "kapsamınız yok" diyordu. Sebep: bu
+IdP'nin `/oauth/token` yanıtı `scope` alanı **içermiyor**. `scope:
+tokens.scope` yazınca oturumun kapsamı boş dizgeye eziliyor, onay her
+seferinde başarılı oluyor ve kayıt her seferinde siliniyordu. Artık boş
+kapsam yanıtı bilinen kapsamı silmiyor ve kapsamın kaynağı önce RFC 7662
+incelemesi; ikisi de söylemiyorsa karar IdP'ye bırakılıyor.
+
 ---
 
 ## Yapılandırma
@@ -688,6 +723,45 @@ fitfak-mail-cert status
 curl -H "Authorization: Bearer …" https://mail.fitfak.net/api/v1/admin/certificates
 ```
 
+### Posta istemcisine taşıma (.pfx)
+
+Outlook, Apple Mail ve Thunderbird S/MIME kimliğini PEM çifti olarak değil,
+tek bir parola korumalı kap olarak istiyor. Ayarlar → S/MIME sertifikası →
+**Posta istemcisi için .pfx**.
+
+```http
+POST /api/v1/mailboxes/:mailbox/certificate/export   { "password": "…" }
+POST /api/v1/mailboxes/:mailbox/certificate/import   (multipart: files=…, password=…)
+```
+
+Üretilen kap RFC 7292 uyumlu: PBES2/AES-256-CBC ile şifreli, **MacData**
+(HMAC-SHA256, PKCS#12 KDF) ile bütünlük korumalı ve `localKeyId` ile
+sertifika–anahtar eşleşmesi işaretli. Bu üçü olmadan dosya Windows sertifika
+deposunda ve macOS Anahtar Zinciri'nde "geçersiz parola" ya da "özel anahtarı
+yok" diye reddediliyor. `openssl pkcs12` ile okunabildiği testlerde
+doğrulanıyor.
+
+Dışa aktarma **özel anahtarı dışarı veren tek uç nokta**; kısıtlar buna göre:
+
+| Kısıt | Neden |
+| --- | --- |
+| Yalnızca tarayıcı oturumu (API jetonu kabul edilmez) | Uzun ömürlü bir jetonun sızması, imzalama kimliğinin sızması olurdu |
+| Kutu üzerinde `owner` yetkisi | Okuma ya da gönderme yetkisi yetmez |
+| CSRF jetonu, `POST` | Parola gövdede gider; `GET` olsaydı adres çubuğuna ve kayıtlara düşerdi |
+| Parola en az 8 karakter | Kap dosya olarak taşınacak; parola tek savunma |
+| `Cache-Control: no-store` | Bir ara önbellek dosyayı tutarsa çevrimdışı deneme için elde kalır |
+| 10 dakikada en fazla 10 istek | Sunucuyu parola denemesinin taşıyıcısı yapmamak |
+| Denetim kaydı | Özel anahtarın ne zaman, kim tarafından alındığı sonradan mutlaka sorulur |
+
+Parola **hiçbir yere yazılmaz** — ne kayda, ne denetim kaydına, ne diske. Kap
+bellekte üretilip doğrudan yanıta yazılır.
+
+İçe aktarmada üç şey kanıtlanmadan kimlik kabul edilmiyor: kap açılıyor (MAC
+tutuyor), sertifika bu adrese ait (SAN'da `rfc822Name`), ve özel anahtar
+sertifikaya ait — bir imza atılıp doğrulanarak. Sonuncusu için açık anahtar
+karşılaştırması yetmiyor: eşleşmeyen bir çifti kabul etmek, imzalayamayan bir
+kimlik kaydetmek olurdu ve hata ancak ilk imzalı gönderimde ortaya çıkardı.
+
 ### İmzalı gönderim
 
 Gönderim isteğine `smime=1` eklemek yeter. İleti detached CMS SignedData
@@ -834,6 +908,8 @@ Hata kodları: `403 SENDER_NOT_ALLOWED`, `409 NO_SMIME_CERT`,
 | `POST /api/v1/mailboxes/:mailbox/certificate/issue` | Kullanıcının kendi kimliğiyle iste/yenile |
 | `POST /api/v1/mailboxes/:mailbox/certificate/register` | Kendi cihazında ürettiği sertifikayı kaydet |
 | `GET /api/v1/mailboxes/:mailbox/certificate/remote` | IdP'nin bu kullanıcı adına verdiği sertifikalar |
+| `POST /api/v1/mailboxes/:mailbox/certificate/export` | Kimliği parola korumalı `.pfx` olarak indir |
+| `POST /api/v1/mailboxes/:mailbox/certificate/import` | Var olan bir `.pfx` kimliğini içe aktar |
 
 `issue` hata kodları:
 
@@ -1023,20 +1099,20 @@ kayıtlarında açık bırakmayın.
 ## Testler
 
 ```bash
-npm test                 # yedi paket, 143 denetim
+npm test                 # yedi paket, 148 denetim
 node test/run-all.js crypto storage      # seçili paketler
 node test/crypto.test.js                 # tek paket, ayrıntılı çıktı
 ```
 
 | Paket | Kapsam | Denetim |
 | --- | --- | --- |
-| `crypto` | DKIM imzala/doğrula (katlama dâhil), SPF, DMARC, S/MIME CMS | 31 |
+| `crypto` | DKIM imzala/doğrula (katlama, oversigning), SPF, DMARC, S/MIME CMS | 32 |
 | `mime` | MIME oluşturma/ayrıştırma, ek politikası, kodlamalar | 24 |
 | `storage` | Veritabanı sürücüsü, depolar, kasa, kuyruk | 31 |
 | `smtp-e2e` | 25/465/587 uçtan uca, DKIM'in üç yolda da uygulanması | 13 |
 | `client` | SMTP istemcisi (aktarıcı, AUTH, DKIM), `defineConfig` | 7 |
 | `auth-identity` | IdP oturumu, kimlik bağları, yönetici kısıtı | 12 |
-| `http-api` | HTTP API, CSRF, ek jetonları, gerçek zamanlı, site | 25 |
+| `http-api` | HTTP API, CSRF, ek jetonları, .pfx dışa/içe aktarma, gerçek zamanlı, site | 29 |
 
 Her paket **ayrı bir süreçte** çalışır: testler ortam değişkenlerini ve modül
 önbelleğini değiştiriyor (yapılandırma açılışta okunuyor), aynı süreçte

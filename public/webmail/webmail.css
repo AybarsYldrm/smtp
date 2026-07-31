@@ -509,7 +509,8 @@ label.field {
 }
 label.field:first-child { margin-top: 0; }
 
-input[type=text], input[type=email], input[type=search], select, textarea {
+input[type=text], input[type=email], input[type=search], input[type=password],
+input[type=file], select, textarea {
   width: 100%;
   padding: 8px 10px;
   border: 1px solid var(--line-strong);
@@ -552,6 +553,12 @@ textarea.body { min-height: 200px; }
 .note-warn { background: var(--warn-bg); color: var(--warn); }
 .note-info { background: var(--info-bg); color: var(--info); }
 .note-actions { margin-top: 10px; display: flex; gap: 6px; flex-wrap: wrap; }
+
+details > summary { list-style: none; }
+details > summary::-webkit-details-marker { display: none; }
+details > summary::before { content: '▸ '; }
+details[open] > summary::before { content: '▾ '; }
+input[type=file] { padding: 6px 8px; font-size: 12.5px; }
 
 .empty { padding: 30px 16px; text-align: center; color: var(--ink-3); font-size: 13px; }
 

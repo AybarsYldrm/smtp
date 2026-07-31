@@ -25,6 +25,21 @@ const { signHs, verifyHs } = require('../../util/jwt');
 
 const FOLDERS = new Set(['inbox', 'sent', 'drafts', 'archive', 'spam', 'trash', 'outbox']);
 
+// .pfx parolası: kap dosya olarak taşınacağı için parola tek savunma. Sekiz
+// karakter düşük bir eşik ama bir SINIR — hiç sınır koymamak, tek tıkla
+// parolasız bir özel anahtar dosyası üretilmesi demekti.
+const MIN_PFX_PASSWORD = 8;
+// İçe aktarılan .pfx boyutu. Bir kimlik kabı birkaç kilobayt; bundan büyüğü
+// ya yanlış dosya ya da belleği tüketmeye çalışan bir istek.
+const MAX_PFX_BYTES = 256 * 1024;
+
+/** Zincir PEM'ini tek tek sertifikalara ayırır. */
+function splitPemChain(pem) {
+  return String(pem).split(/(?=-----BEGIN CERTIFICATE-----)/)
+    .map((s) => s.trim())
+    .filter((s) => s.includes('BEGIN CERTIFICATE'));
+}
+
 function registerWebmailRoutes(router, deps) {
   const {
     config, logger, stores, sessions, pipeline, queue, push, realtime, signer, certificates,
@@ -778,6 +793,179 @@ function registerWebmailRoutes(router, deps) {
     } catch (err) {
       throw new HttpError(err.status || 400, err.message, { code: 'CERT_REGISTER_FAILED' });
     }
+  });
+
+  /**
+   * S/MIME kimliğini .pfx olarak dışa aktarır.
+   *
+   * ── GÜVENLİK ────────────────────────────────────────────────────────────
+   * Bu uç nokta ÖZEL ANAHTARI dışarı veren tek yer; kısıtlar buna göre:
+   *
+   *   - Yalnızca TARAYICI OTURUMU. API jetonu kabul edilmiyor: uzun ömürlü
+   *     bir jetonun sızması, o kutunun imzalama kimliğinin sızması olurdu.
+   *   - Kutu üzerinde `owner` yetkisi. Okuma ya da gönderme yetkisi yetmez.
+   *   - CSRF jetonu (durum değiştirmiyor ama gövdede parola taşıyor; GET
+   *     olsaydı parola adres çubuğuna ve kayıtlara düşerdi).
+   *   - Parola İSTEMCİDEN gelir ve HİÇBİR YERE yazılmaz — ne kayda, ne
+   *     denetim kaydına, ne diske. Kap bellekte üretilip doğrudan yanıta
+   *     yazılır.
+   *   - Yanıt `no-store`: bir ara önbellek .pfx'i tutarsa parola korumalı
+   *     bile olsa çevrimdışı deneme için elde kalır.
+   *   - Denetim kaydı düşülür: özel anahtarın ne zaman ve kimin tarafından
+   *     dışarı alındığı sonradan mutlaka sorulur.
+   */
+  router.post('/api/v1/mailboxes/:mailbox/certificate/export', async (ctx) => {
+    const session = await requireSession(ctx);
+    if (session.isApiToken) {
+      throw new HttpError(403, 'Özel anahtar dışa aktarımı tarayıcı oturumu gerektirir', { code: 'INTERACTIVE_REQUIRED' });
+    }
+    ctx.state.input = await ctx.input();
+    requireCsrf(ctx, session);
+    const { mailbox } = await resolveMailbox(ctx, session, ctx.params.mailbox, 'owner');
+
+    const password = String(ctx.state.input.fields.password || '');
+    if (password.length < MIN_PFX_PASSWORD) {
+      throw new HttpError(400, `Parola en az ${MIN_PFX_PASSWORD} karakter olmalı`, { code: 'PASSWORD_TOO_SHORT' });
+    }
+
+    const pair = await stores.certificates.getSigningPair('smime', mailbox.address);
+    if (!pair || !pair.privateKeyPem) {
+      throw new HttpError(404, 'Bu adres için özel anahtarı sunucuda olan bir sertifika yok', { code: 'NO_EXPORTABLE_KEY' });
+    }
+
+    const { build } = require('../../certs/pkcs12');
+    let pfx;
+    try {
+      pfx = build({
+        certPem: pair.certPem,
+        privateKeyPem: pair.privateKeyPem,
+        chainPems: pair.chainPem ? splitPemChain(pair.chainPem) : [],
+        password,
+        friendlyName: `${mailbox.displayName || mailbox.address} (S/MIME)`,
+      });
+    } catch (err) {
+      logger.error({ mailbox: mailbox.address, error: err.message, msg: 'pfx üretilemedi' });
+      throw new HttpError(500, `PFX üretilemedi: ${err.message}`, { code: 'PFX_BUILD_FAILED' });
+    }
+
+    await stores.audit.record({
+      actorSub: session.idpSub, actorEmail: session.idpEmail,
+      action: 'certificate.export_pfx', targetType: 'mailbox', targetId: mailbox.ref, ip: ctx.ip,
+      detail: { serialHex: pair.serialHex, sizeBytes: pfx.length },
+    });
+    logger.warn({
+      mailbox: mailbox.address, actor: session.idpEmail, bytes: pfx.length,
+      msg: 'S/MIME özel anahtarı .pfx olarak dışa aktarıldı',
+    });
+
+    const fileName = safeFileName(`${mailbox.address}.pfx`);
+    ctx.setHeader('content-disposition', `attachment; filename="${fileName}"`);
+    ctx.setHeader('cache-control', 'no-store, no-cache, must-revalidate, private');
+    ctx.setHeader('pragma', 'no-cache');
+    ctx.setHeader('x-content-type-options', 'nosniff');
+    ctx.send(200, pfx, 'application/x-pkcs12');
+  });
+
+  /**
+   * Başka bir yerde üretilmiş bir .pfx'i içe aktarır.
+   *
+   * Kabul etmeden önce ÜÇ şey kanıtlanır ve üçü de gerekli:
+   *   1. Kap açılıyor (parola doğru, MAC tutuyor).
+   *   2. Sertifika BU adrese ait — SAN'ında rfc822Name olarak var. Aksi
+   *      hâlde bir kullanıcı, başkasının adresine ait bir sertifikayı kendi
+   *      kutusuna bağlayıp onun adına imza attırabilirdi.
+   *   3. Özel anahtar SERTİFİKAYA ait — bir imza atılıp doğrulanarak. Açık
+   *      anahtarları karşılaştırmak yetmez; eşleşmeyen bir çifti kabul etmek,
+   *      imzalayamayan bir kimlik kaydetmek olurdu.
+   */
+  router.post('/api/v1/mailboxes/:mailbox/certificate/import', async (ctx) => {
+    const session = await requireSession(ctx);
+    if (session.isApiToken) {
+      throw new HttpError(403, 'Sertifika içe aktarımı tarayıcı oturumu gerektirir', { code: 'INTERACTIVE_REQUIRED' });
+    }
+    ctx.state.input = await ctx.input();
+    requireCsrf(ctx, session);
+    const { mailbox } = await resolveMailbox(ctx, session, ctx.params.mailbox, 'owner');
+
+    const { fields, files } = ctx.state.input;
+    const upload = (files || [])[0];
+    const raw = upload ? upload.content
+      : (fields.pfxBase64 ? Buffer.from(String(fields.pfxBase64), 'base64') : null);
+    if (!raw || !raw.length) throw new HttpError(400, 'Bir .pfx dosyası gerekiyor', { code: 'FILE_REQUIRED' });
+    if (raw.length > MAX_PFX_BYTES) {
+      throw new HttpError(413, `.pfx dosyası çok büyük (en fazla ${MAX_PFX_BYTES} bayt)`, { code: 'FILE_TOO_LARGE' });
+    }
+
+    const password = String(fields.password || '');
+    const { parse, keyMatchesCertificate } = require('../../certs/pkcs12');
+
+    let parsed;
+    try {
+      parsed = parse(raw, password);
+    } catch (err) {
+      // Parola hatası ile bozuk dosya AYRILMIYOR: ikisini ayırmak, doğru
+      // parolayı arayan birine geri bildirim vermek olurdu.
+      logger.warn({ mailbox: mailbox.address, error: err.message, msg: 'pfx okunamadı' });
+      throw new HttpError(400, 'Dosya açılamadı — parola yanlış ya da dosya desteklenmeyen biçimde', {
+        code: 'PFX_UNREADABLE',
+      });
+    }
+
+    const certPem = parsed.certificates[0];
+    const privateKeyPem = parsed.privateKeys[0];
+    if (!certPem || !privateKeyPem) {
+      throw new HttpError(400, 'Dosyada sertifika ve özel anahtar birlikte bulunmalı', { code: 'PFX_INCOMPLETE' });
+    }
+
+    let x509;
+    try { x509 = new (require('node:crypto').X509Certificate)(certPem); }
+    catch { throw new HttpError(400, 'Sertifika okunamadı', { code: 'CERT_UNREADABLE' }); }
+
+    const address = mailbox.address;
+    const san = String(x509.subjectAltName || '').toLowerCase();
+    const subject = String(x509.subject || '').toLowerCase();
+    if (!san.includes(`email:${address}`) && !subject.includes(`emailaddress=${address}`)) {
+      throw new HttpError(400, `Sertifika ${address} adresini içermiyor`, { code: 'ADDRESS_MISMATCH' });
+    }
+    if (new Date(x509.validTo).getTime() < Date.now()) {
+      throw new HttpError(400, 'Sertifikanın süresi dolmuş', { code: 'CERT_EXPIRED' });
+    }
+    if (!keyMatchesCertificate(privateKeyPem, certPem)) {
+      throw new HttpError(400, 'Özel anahtar bu sertifikaya ait değil', { code: 'KEY_MISMATCH' });
+    }
+
+    const stored = await stores.certificates.store({
+      usage: 'smime',
+      subjectAddress: address,
+      mailboxRef: mailbox.ref,
+      certPem,
+      chainPem: parsed.certificates.slice(1).join('\n'),
+      privateKeyPem,
+      issuedVia: 'imported',
+      requestedBySub: session.idpSub,
+      renewAtRatio: config.trust.renewAtLifetimeRatio,
+    });
+    if (signer) signer.invalidate(address);
+
+    await stores.audit.record({
+      actorSub: session.idpSub, actorEmail: session.idpEmail,
+      action: 'certificate.import_pfx', targetType: 'mailbox', targetId: mailbox.ref, ip: ctx.ip,
+      detail: {
+        fingerprint: String(x509.fingerprint256 || '').replace(/:/g, '').toLowerCase(),
+        notAfter: new Date(x509.validTo).getTime(),
+        chainLength: parsed.certificates.length - 1,
+      },
+    });
+    logger.info({ mailbox: address, version: stored.version, msg: 'S/MIME kimliği .pfx dosyasından içe aktarıldı' });
+
+    ctx.json(200, {
+      ok: true,
+      version: stored.version,
+      subject: x509.subject,
+      issuer: x509.issuer,
+      notAfter: new Date(x509.validTo).getTime(),
+      chainLength: parsed.certificates.length - 1,
+    });
   });
 
   /** IdP'nin bu kullanıcı adına verdiği tüm sertifikalar (uzaktan). */

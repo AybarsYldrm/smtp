@@ -400,6 +400,10 @@ const HTTP_CFG = {
     windowMs: int('FITFAK_HTTP_RATE_WINDOW_MS', 'http.rateLimit.windowMs', 60_000),
     max: int('FITFAK_HTTP_RATE_MAX', 'http.rateLimit.max', 240),
     sendMax: int('FITFAK_HTTP_RATE_SEND_MAX', 'http.rateLimit.sendMax', 30),
+    // Anahtar malzemesi uçları (.pfx dışa/içe aktarma). Meşru kullanımda
+    // günde birkaç çağrı; kötüye kullanımda parola denemesinin taşıyıcısı.
+    keyMaterialWindowMs: int('FITFAK_HTTP_KEY_WINDOW_MS', 'http.rateLimit.keyMaterialWindowMs', 10 * 60_000),
+    keyMaterialMax: int('FITFAK_HTTP_KEY_MAX', 'http.rateLimit.keyMaterialMax', 10),
   },
   // Statik dosyaları ve HTML'i her istekte diskten okumak yerine önbelleğe
   // al (geliştirmede kapatılır).

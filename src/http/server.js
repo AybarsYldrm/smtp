@@ -43,9 +43,17 @@ class HttpServers {
       windowMs: this.config.http.rateLimit.windowMs,
       max: this.config.http.rateLimit.sendMax,
     });
+    // Anahtar malzemesi (.pfx dışa/içe aktarma) için ayrı ve çok daha dar
+    // bir pencere: bunlar meşru kullanımda günde birkaç kez çağrılır,
+    // kötüye kullanımda ise parola denemesinin taşıyıcısı olur.
+    this.keyMaterialLimiter = new SlidingWindowLimiter({
+      windowMs: this.config.http.rateLimit.keyMaterialWindowMs,
+      max: this.config.http.rateLimit.keyMaterialMax,
+    });
     this.sweeper = setInterval(() => {
       this.generalLimiter.sweep();
       this.sendLimiter.sweep();
+      this.keyMaterialLimiter.sweep();
     }, 300_000);
     if (this.sweeper.unref) this.sweeper.unref();
   }
@@ -89,6 +97,21 @@ class HttpServers {
       const verdict = this.sendLimiter.check(`send:${ctx.ip}`);
       if (!verdict.allowed) {
         throw new HttpError(429, 'Gönderim hızı sınırı aşıldı', { code: 'SEND_RATE_LIMITED' });
+      }
+    });
+    // Anahtar malzemesine dokunan uçlar EN SIKI sınırda.
+    //
+    // `export` özel anahtarı dışarı veriyor, `import` bir parolayı deniyor.
+    // İkisi de çevrimdışı deneme için yem: sınırsız bırakıldığında bir
+    // saldırgan zayıf bir .pfx parolasını sunucu üzerinden deneyebilir ya da
+    // her denemede yeni bir kap indirip yerelde kırmayı sürdürebilir.
+    router.use(async (ctx) => {
+      if (!/\/certificate\/(export|import)$/.test(ctx.pathname) || ctx.method !== 'POST') return;
+      const verdict = this.keyMaterialLimiter.check(`key:${ctx.ip}`);
+      if (!verdict.allowed) {
+        throw new HttpError(429, 'Çok fazla deneme — bir süre sonra tekrar deneyin', {
+          code: 'KEY_RATE_LIMITED',
+        });
       }
     });
 
