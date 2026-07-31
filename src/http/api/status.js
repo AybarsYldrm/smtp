@@ -117,14 +117,54 @@ function registerStatusRoutes(router, deps) {
     ctx.json(200, { items });
   });
 
-  /** DNS uyum denetimi: beklenen kayıtlar ile yayında olanlar. */
+  /**
+   * DNS uyum denetimi: beklenen kayıtlar ile yayında olanlar.
+   *
+   * `?refresh=1` denetimi ŞİMDİ çalıştırır ve sonucunu döndürür — saklanan
+   * kayıt geçmişi yerine canlı durum. `provider` bloğu, yazma yapılıp
+   * yapılamayacağını ve yapılamıyorsa nedenini söyler; "autoApply açık ama
+   * Cloudflare'de bir şey görmüyorum" sorusunun cevabı orada.
+   */
   router.get('/api/v1/status/dns', async (ctx) => {
     const session = await requireStatusAccess(ctx);
     sessions.requireAdmin(session);
+    let live = null;
     if (ctx.query.get('refresh') === '1' && dnsAuditor) {
-      await dnsAuditor.audit({ apply: false });
+      live = await dnsAuditor.audit({ apply: false });
     }
-    ctx.json(200, { records: await stores.dnsAudit.list() });
+    ctx.json(200, {
+      provider: dnsAuditor
+        ? {
+          name: config.dns.provider,
+          autoApply: config.dns.autoApply,
+          ...dnsAuditor._writeCapability(),
+        }
+        : { name: 'none', autoApply: false, ok: false, reason: 'DNS denetimi kapalı' },
+      expected: dnsAuditor ? await dnsAuditor.expectedRecords().catch(() => []) : [],
+      live,
+      records: await stores.dnsAudit.list(),
+    });
+  });
+
+  /** Cloudflare kimlik bilgileri ve bölge gerçekten çalışıyor mu? */
+  router.post('/api/v1/status/dns/verify', async (ctx) => {
+    const session = await requireStatusAccess(ctx);
+    sessions.requireAdmin(session);
+    if (!dnsAuditor) throw new HttpError(503, 'DNS sağlayıcısı yapılandırılmamış');
+    ctx.json(200, await dnsAuditor.verifyProvider());
+  });
+
+  /**
+   * Kasa sağlığı: her sır AÇILABİLİYOR MU?
+   *
+   * "Kasaya eklemede sorun yok ama geri getirmede emin değilim" sorusunun
+   * ölçülebilir cevabı. Değerler DÖNMEZ; yalnızca sayılar ve açılamayan
+   * kayıtların nedeni.
+   */
+  router.get('/api/v1/status/vault', async (ctx) => {
+    const session = await requireStatusAccess(ctx);
+    sessions.requireAdmin(session);
+    ctx.json(200, await stores.vault.diagnose());
   });
 
   router.post('/api/v1/status/dns/apply', async (ctx) => {

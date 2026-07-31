@@ -401,12 +401,23 @@ class KeyVault {
    * yalnızca açılıp açılamadığı ve açılamıyorsa NEDENİ.
    */
   async diagnose({ kinds = null } = {}) {
-    const out = { total: 0, ok: 0, failed: 0, byKind: {}, problems: [] };
+    // `mismatched` ile `failed` AYRI sayılır ve ayrım önemli:
+    //
+    //   mismatched — kayıt başka bir kasa anahtarıyla sarılmış. Veri
+    //                sağlamdır; ya sır döndürülmüş ve `rewrapAll`
+    //                tamamlanmamıştır, ya da eski bir sırla yazılmıştır.
+    //   failed     — anahtar doğru ama içerik açılamıyor. Bu gerçek bir
+    //                bozulmadır ve yedekten dönmeyi gerektirir.
+    //
+    // İkisini tek sayıda toplamak, "3 kayıt bozuk" diye alarm verip
+    // operatörü yedeğe göndermek olurdu; oysa yapılması gereken şey
+    // rotasyonu tamamlamak olabilir.
+    const out = { total: 0, ok: 0, failed: 0, mismatched: 0, byKind: {}, problems: [] };
     for await (const row of this.collection.scan()) {
       if (kinds && !kinds.includes(row.kind)) continue;
       out.total++;
       const kind = row.kind || 'bilinmiyor';
-      out.byKind[kind] = out.byKind[kind] || { ok: 0, failed: 0 };
+      out.byKind[kind] = out.byKind[kind] || { ok: 0, failed: 0, mismatched: 0 };
       try {
         const value = this._unwrap(
           row.ciphertext,
@@ -423,13 +434,15 @@ class KeyVault {
         out.ok++;
         out.byKind[kind].ok++;
       } catch (err) {
-        out.failed++;
-        out.byKind[kind].failed++;
+        const mismatch = err.code === 'VAULT_KEY_MISMATCH';
+        if (mismatch) { out.mismatched++; out.byKind[kind].mismatched++; }
+        else { out.failed++; out.byKind[kind].failed++; }
         out.problems.push({
           kind: row.kind,
           version: Number(row.version || 0),
           status: row.status,
           code: err.code || 'UNKNOWN',
+          wrapKeyId: row.wrapKeyId || '',
           error: err.message,
         });
       }

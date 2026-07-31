@@ -1,5 +1,7 @@
 'use strict';
 
+const crypto = require('node:crypto');
+
 const { HttpError } = require('../router');
 const { normalizeAddress, safeFileName, htmlEscape } = require('../../util/encoding');
 const { signHs, verifyHs } = require('../../util/jwt');
@@ -792,6 +794,138 @@ function registerWebmailRoutes(router, deps) {
     }
   });
 
+  /* ── .pfx (PKCS#12) dışa/içe aktarma ───────────────────────── */
+
+  /**
+   * S/MIME sertifikasını ve özel anahtarını .pfx olarak indirir.
+   *
+   * Bu, özel anahtarın sunucudan ÇIKTIĞI tek yol ve bilinçli olarak zor:
+   *   - `owner` yetkisi ve CSRF gerekli,
+   *   - POST (GET olsaydı bir bağlantı tıklaması yeterdi),
+   *   - en az 8 karakterlik bir parola ZORUNLU — parolasız bir .pfx,
+   *     indirmeler klasöründe duran düz metin bir özel anahtardır,
+   *   - denetim kaydına yazılır: bir anahtarın dışarı çıktığı, sonradan
+   *     mutlaka sorulacak bir sorudur.
+   *
+   * Dosya Thunderbird, Outlook, Apple Mail ve iOS/Android profillerinde
+   * doğrudan içe aktarılabilir.
+   */
+  router.post('/api/v1/mailboxes/:mailbox/certificate/export', async (ctx) => {
+    const session = await requireSession(ctx);
+    ctx.state.input = await ctx.input();
+    requireCsrf(ctx, session);
+    const { mailbox } = await resolveMailbox(ctx, session, ctx.params.mailbox, 'owner');
+
+    const password = String(ctx.state.input.fields.password || '');
+    if (password.length < 8) {
+      throw new HttpError(400, 'En az 8 karakterlik bir dosya parolası gerekiyor', {
+        code: 'PFX_PASSWORD_REQUIRED',
+      });
+    }
+
+    const pair = await stores.certificates.getSigningPair('smime', mailbox.address);
+    if (!pair) {
+      throw new HttpError(404, `${mailbox.address} için özel anahtarı sunucuda olan bir S/MIME sertifikası yok`, {
+        code: 'NO_EXPORTABLE_CERT',
+      });
+    }
+
+    const { PKCS12 } = require('../../certs/pkcs12');
+    const chain = pair.chainPem ? splitPemChain(pair.chainPem) : [];
+    const pfx = new PKCS12(password).build(pair.certPem, pair.privateKeyPem, {
+      friendlyName: `${mailbox.displayName || mailbox.address} (S/MIME)`,
+      chainPem: chain,
+    });
+
+    await stores.audit.record({
+      actorSub: session.idpSub, actorEmail: session.idpEmail,
+      action: 'certificate.export_pfx', targetType: 'mailbox', targetId: mailbox.ref, ip: ctx.ip,
+      detail: { serialHex: pair.serialHex, chainLength: chain.length },
+    });
+    logger.warn({
+      mailbox: mailbox.address, actor: session.idpEmail, serialHex: pair.serialHex,
+      msg: 'S/MIME özel anahtarı .pfx olarak dışa aktarıldı',
+    });
+
+    const fileName = safeFileName(`${mailbox.address.replace('@', '-at-')}.pfx`);
+    ctx.setHeader('content-disposition', `attachment; filename="${fileName}"`);
+    ctx.setHeader('cache-control', 'no-store');
+    ctx.send(200, pfx, 'application/x-pkcs12');
+  });
+
+  /**
+   * Dışarıda üretilmiş bir anahtar/sertifika çiftini .pfx'ten içeri alır.
+   *
+   * Sertifikanın gerçekten bu kutuya ait olduğu ve anahtarın gerçekten o
+   * sertifikaya ait olduğu DOĞRULANIR. İkisi de şart:
+   *   - adres denetimi olmadan, herhangi bir sertifika bir kutuya
+   *     bağlanabilir ve o kutunun adına imza atılmış gibi görünürdü,
+   *   - eşleşme denetimi olmadan, anahtarla sertifika uyuşmayan bir çift
+   *     saklanır ve hata ancak ilk imzalamada, çok daha geç görülürdü.
+   */
+  router.post('/api/v1/mailboxes/:mailbox/certificate/import', async (ctx) => {
+    const session = await requireSession(ctx);
+    ctx.state.input = await ctx.input();
+    requireCsrf(ctx, session);
+    const { mailbox } = await resolveMailbox(ctx, session, ctx.params.mailbox, 'owner');
+
+    const { fields, files } = ctx.state.input;
+    const uploaded = (files || [])[0];
+    const pfxBytes = uploaded
+      ? uploaded.content
+      : (fields.pfx ? decodeDeclaredContent({ content: fields.pfx, encoding: 'base64', fileName: 'pfx' }) : null);
+    if (!pfxBytes || !pfxBytes.length) {
+      throw new HttpError(400, 'Bir .pfx dosyası gerekiyor', { code: 'PFX_MISSING' });
+    }
+
+    const { PKCS12 } = require('../../certs/pkcs12');
+    let parsed;
+    try {
+      parsed = new PKCS12(String(fields.password || '')).parse(pfxBytes);
+    } catch (err) {
+      throw new HttpError(400, err.message, { code: 'PFX_UNREADABLE' });
+    }
+    if (!parsed.certificates.length || !parsed.privateKeys.length) {
+      throw new HttpError(400, 'Dosyada sertifika ve özel anahtar birlikte bulunmalı', {
+        code: 'PFX_INCOMPLETE',
+      });
+    }
+
+    const verdict = matchCertificateToMailbox(parsed, mailbox.address);
+    if (!verdict.ok) throw new HttpError(400, verdict.reason, { code: verdict.code });
+
+    const stored = await stores.certificates.store({
+      usage: 'smime',
+      subjectAddress: mailbox.address,
+      mailboxRef: mailbox.ref,
+      certPem: verdict.certPem,
+      chainPem: verdict.chainPem,
+      privateKeyPem: verdict.privateKeyPem,
+      issuedVia: 'pfx-import',
+      requestedBySub: session.idpSub,
+      renewAtRatio: config.trust.renewAtLifetimeRatio,
+    });
+    if (signer) signer.invalidate(mailbox.address);
+
+    await stores.audit.record({
+      actorSub: session.idpSub, actorEmail: session.idpEmail,
+      action: 'certificate.import_pfx', targetType: 'mailbox', targetId: mailbox.ref, ip: ctx.ip,
+      detail: { version: stored.version, chainLength: verdict.chainCount },
+    });
+    logger.info({
+      mailbox: mailbox.address, version: stored.version,
+      msg: 'S/MIME sertifikası .pfx dosyasından içeri alındı',
+    });
+
+    ctx.json(200, {
+      ok: true,
+      version: stored.version,
+      replaced: stored.replaced,
+      chainLength: verdict.chainCount,
+      macVerified: parsed.macVerified,
+    });
+  });
+
   /** IdP'nin bu kullanıcı adına verdiği tüm sertifikalar (uzaktan). */
   router.get('/api/v1/mailboxes/:mailbox/certificate/remote', async (ctx) => {
     const session = await requireSession(ctx);
@@ -913,6 +1047,89 @@ function parseAddressField(value) {
     if (address.includes('@')) out.push({ address, name: '' });
   }
   return out;
+}
+
+/** Birden fazla sertifika taşıyan bir PEM bloğunu tek tek ayırır. */
+function splitPemChain(pem) {
+  return String(pem || '')
+    .split(/(?=-----BEGIN CERTIFICATE-----)/)
+    .map((s) => s.trim())
+    .filter((s) => s.includes('BEGIN CERTIFICATE'));
+}
+
+/**
+ * .pfx içeriğindeki hangi sertifikanın bu kutuya ait olduğunu bulur ve
+ * anahtarla eşleştiğini DOĞRULAR.
+ *
+ * İki ayrı soru soruluyor ve ikisi de gerekli:
+ *
+ *   1. Sertifika bu ADRESE mi ait? S/MIME'de adres SAN'daki rfc822Name'dir;
+ *      yalnızca CN'e bakmak, CN'ine istediğini yazan birine bu kutunun
+ *      adına imza attırırdı.
+ *   2. Özel anahtar bu SERTİFİKAYA mı ait? Açık anahtarlar karşılaştırılıyor.
+ *      Karşılaştırmadan saklamak, uyuşmayan bir çifti kabul edip hatayı ilk
+ *      imzalama denemesine ertelemek olurdu — ve o an, sorunun kaynağından
+ *      çok uzakta.
+ */
+function matchCertificateToMailbox(parsed, address) {
+  const addr = normalizeAddress(address);
+
+  const publicKeyOf = (pem) => {
+    try {
+      return crypto.createPublicKey(pem).export({ type: 'spki', format: 'der' }).toString('hex');
+    } catch { return null; }
+  };
+
+  const keyFingerprints = new Map();
+  for (const keyPem of parsed.privateKeys) {
+    const fp = publicKeyOf(keyPem);
+    if (fp) keyFingerprints.set(fp, keyPem);
+  }
+
+  const candidates = [];
+  for (const certPem of parsed.certificates) {
+    let x;
+    try { x = new crypto.X509Certificate(certPem); }
+    catch { continue; }
+    const san = String(x.subjectAltName || '').toLowerCase();
+    const subject = String(x.subject || '').toLowerCase();
+    const matchesAddress = san.includes(`email:${addr}`) || subject.includes(`emailaddress=${addr}`);
+    const fp = publicKeyOf(x.publicKey.export({ type: 'spki', format: 'pem' }));
+    candidates.push({ certPem, x, matchesAddress, hasKey: fp && keyFingerprints.has(fp), fp });
+  }
+
+  const chosen = candidates.find((c) => c.matchesAddress && c.hasKey);
+  if (!chosen) {
+    const addressMatch = candidates.find((c) => c.matchesAddress);
+    if (!addressMatch) {
+      return {
+        ok: false,
+        code: 'PFX_ADDRESS_MISMATCH',
+        reason: `Dosyadaki sertifikaların hiçbiri ${addr} adresini içermiyor `
+          + `(bulunan: ${candidates.map((c) => c.x.subject.replace(/\n/g, ' ')).join(' | ') || 'yok'})`,
+      };
+    }
+    return {
+      ok: false,
+      code: 'PFX_KEY_MISMATCH',
+      reason: `${addr} sertifikası bulundu ama dosyadaki özel anahtarlardan hiçbiri ona ait değil`,
+    };
+  }
+
+  if (new Date(chosen.x.validTo).getTime() < Date.now()) {
+    return { ok: false, code: 'PFX_EXPIRED', reason: 'Sertifikanın süresi dolmuş' };
+  }
+
+  // Kalan sertifikalar zincir sayılır: ara CA'lar burada geliyor ve
+  // olmadıklarında imza doğrulanamıyor.
+  const chain = candidates.filter((c) => c !== chosen).map((c) => c.certPem);
+  return {
+    ok: true,
+    certPem: chosen.certPem,
+    privateKeyPem: keyFingerprints.get(chosen.fp),
+    chainPem: chain.join('\n'),
+    chainCount: chain.length,
+  };
 }
 
 /**
@@ -1046,5 +1263,5 @@ function sanitizeHtml(html) {
 
 module.exports = {
   registerWebmailRoutes, sanitizeHtml, parseAddressField, parseRange,
-  collectAttachments, decodeDeclaredContent,
+  collectAttachments, decodeDeclaredContent, splitPemChain, matchCertificateToMailbox,
 };
