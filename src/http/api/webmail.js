@@ -308,27 +308,44 @@ function registerWebmailRoutes(router, deps) {
       'accept-ranges': 'bytes',
     };
 
+    // Baytlar akıtılırken İKİ şey garanti edilmeli, yoksa ek bozuk iner:
+    //   - yazılan her parça gerçekten Buffer olmalı (bir dizge yazmak,
+    //     `content-length` bayt cinsinden hesaplandığı için gövdeyi kesik
+    //     bırakır),
+    //   - `write()` false döndüğünde 'drain' beklenmeli; beklemezsek büyük
+    //     ekler süreç belleğinde birikir.
+    const streamTo = async (statusCode, extraHeaders, readOptions) => {
+      ctx.responded = true;
+      ctx.res.writeHead(statusCode, extraHeaders);
+      let written = 0;
+      for await (const chunk of stores.blobs.readStream(attachment.blobId, readOptions)) {
+        const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+        written += buf.length;
+        if (!ctx.res.write(buf)) {
+          await new Promise((resolve) => ctx.res.once('drain', resolve));
+        }
+      }
+      ctx.res.end();
+      const expected = Number(extraHeaders['content-length']);
+      if (Number.isFinite(expected) && written !== expected) {
+        // Gövde ile başlık çeliştiyse istemci sessizce kesik dosya alır.
+        // Bağlantı zaten yazıldı; yapılabilecek tek şey bunu görünür kılmak.
+        logger.error({
+          attachment: attachment.ref, blobId: attachment.blobId, expected, written,
+          msg: 'ek gövdesi bildirilen uzunlukla eşleşmedi',
+        });
+      }
+    };
+
     if (range) {
       headers['content-range'] = `bytes ${range.start}-${range.end}/${meta.totalBytes}`;
       headers['content-length'] = range.end - range.start + 1;
-      ctx.responded = true;
-      ctx.res.writeHead(206, headers);
-      
-      for await (const chunk of stores.blobs.readStream(attachment.blobId, range)) {
-        ctx.res.write(chunk);
-      }
-      ctx.res.end();
+      await streamTo(206, headers, range);
       return;
     }
 
     headers['content-length'] = meta.totalBytes;
-    ctx.responded = true;
-    ctx.res.writeHead(200, headers);
-    
-    for await (const chunk of stores.blobs.readStream(attachment.blobId)) {
-        ctx.res.write(chunk);
-    }
-    ctx.res.end();
+    await streamTo(200, headers, {});
   });
 
   /* ── ileti durumu ──────────────────────────────────────────── */
@@ -708,14 +725,19 @@ function registerWebmailRoutes(router, deps) {
     });
 
     if (!delegated.ok) {
-      // 2. Kapsam (scope) eksikse arayüze 409 dönüp /yetki-yukselt adresi veriliyor:
+      // Kapsam eksikse arayüz kullanıcıyı onay turuna götürsün diye 409 ve
+      // ADRES döner. Adres İNGİLİZCE: yollar ve parametreler bir sözleşmedir,
+      // belgelerde ve istemcilerde geçerler.
       const returnTo = String(ctx.state.input.fields.returnTo || '/');
       throw new HttpError(409, delegated.message, {
         code: delegated.code === 'scope_required' ? 'CERT_SCOPE_REQUIRED' : 'IDP_REAUTH_REQUIRED',
         detail: {
           requiredScope: config.trust.issueScope,
-          authorizeUrl: `/yetki-yukselt?kapsam=${encodeURIComponent(config.trust.issueScope)}`
-            + `&donus=${encodeURIComponent(returnTo)}`,
+          grantedScopes: delegated.grantedScopes || [],
+          // Onayın AYNI hesapla verilmesi gerektiği arayüzde söylenebilsin.
+          approveAs: session.idpEmail,
+          authorizeUrl: `/authorize-scope?scope=${encodeURIComponent(config.trust.issueScope)}`
+            + `&return_to=${encodeURIComponent(returnTo)}`,
         },
       });
     }
@@ -893,6 +915,51 @@ function parseAddressField(value) {
   return out;
 }
 
+/**
+ * JSON gövdesinde bildirilen bir ekin baytlarını çözer.
+ *
+ * Kodlama TAHMİN EDİLMEZ, sırayla ELENİR — ve her adım tersine çevrilebilir
+ * olduğu için yanlış seçim sessiz bozulma değil, açık bir davranış üretir:
+ *
+ *   1. `content` zaten ikili ise (Buffer / dizi / {type:'Buffer'}) olduğu gibi.
+ *   2. `encoding` açıkça verilmişse ona uyulur ("base64" | "utf8" | "hex").
+ *   3. `data:...;base64,` ön eki varsa atılır ve gerisi base64'tür.
+ *   4. Aksi hâlde base64 olarak çözülür ve YENİDEN KODLANIP karşılaştırılır;
+ *      tutmuyorsa değer base64 değildir ve düz metin (UTF-8) kabul edilir.
+ *
+ * 4. adımdaki gidiş-dönüş denetimi şart: `Buffer.from(x,'base64')`
+ * hoşgörülüdür ve base64 olmayan girdiyi hata vermeden yutar. Denetim
+ * olmadan "aybars" gibi bir metin, sessizce üç çöp bayta dönüşürdü.
+ */
+function decodeDeclaredContent(entry) {
+  const raw = entry.content;
+  if (Buffer.isBuffer(raw)) return raw;
+  if (raw instanceof Uint8Array) return Buffer.from(raw);
+  if (Array.isArray(raw)) return Buffer.from(raw);
+  if (raw && typeof raw === 'object' && Array.isArray(raw.data)) return Buffer.from(raw.data);
+
+  let text = String(raw);
+  const declaredEncoding = String(entry.encoding || '').toLowerCase();
+  const dataUrl = text.match(/^data:[^,]*;base64,/i);
+  if (dataUrl) text = text.slice(dataUrl[0].length);
+
+  if (declaredEncoding === 'utf8' || declaredEncoding === 'text') return Buffer.from(text, 'utf8');
+  if (declaredEncoding === 'hex') return Buffer.from(text.replace(/\s+/g, ''), 'hex');
+
+  const compact = text.replace(/\s+/g, '');
+  const decoded = Buffer.from(compact, 'base64');
+  if (decoded.length && decoded.toString('base64').replace(/=+$/, '') === compact.replace(/=+$/, '')) {
+    return decoded;
+  }
+  if (dataUrl || declaredEncoding === 'base64') {
+    const err = new HttpError(400, `"${entry.fileName || 'ek'}" base64 olarak çözülemedi`, {
+      code: 'ATTACHMENT_ENCODING_INVALID',
+    });
+    throw err;
+  }
+  return Buffer.from(text, 'utf8');
+}
+
 /** Hem multipart dosyalarını hem JSON base64 eklerini tek biçime getirir. */
 function collectAttachments(fields, files, config) {
   const out = [];
@@ -910,23 +977,10 @@ function collectAttachments(fields, files, config) {
     : [];
   for (const entry of [].concat(declared || [])) {
     if (!entry || !entry.content) continue;
-
-    let rawContent = entry.content;
-
-    // 1. İHTİMAL: Web arayüzü "data:image/png;base64,..." gibi bir Data URL gönderiyorsa öneki çöpe at.
-    if (rawContent.includes('base64,')) {
-      rawContent = rawContent.split('base64,')[1];
-    } 
-    // 2. İHTİMAL: Web arayüzü dosyayı base64'e çevirmeden doğrudan "aybars" gibi düz metin atıyorsa, 
-    // bunu algılayıp utf8 üzerinden manuel olarak base64'e çevir.
-    else if (!/^[A-Za-z0-9+/=\s]+$/.test(rawContent)) {
-      rawContent = Buffer.from(rawContent, 'utf8').toString('base64');
-    }
-
     out.push({
       fileName: safeFileName(entry.fileName || 'ek.bin'),
       contentType: entry.contentType || 'application/octet-stream',
-      content: Buffer.from(rawContent, 'base64'),
+      content: decodeDeclaredContent(entry),
       contentId: entry.contentId || '',
       inline: !!entry.inline && !!entry.contentId,
     });
@@ -990,4 +1044,7 @@ function sanitizeHtml(html) {
   return out;
 }
 
-module.exports = { registerWebmailRoutes, sanitizeHtml, parseAddressField, parseRange, collectAttachments };
+module.exports = {
+  registerWebmailRoutes, sanitizeHtml, parseAddressField, parseRange,
+  collectAttachments, decodeDeclaredContent,
+};

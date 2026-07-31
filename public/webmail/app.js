@@ -814,8 +814,15 @@ async function requestCertificate(button, force) {
       // Yetki onayına gitmeden önce hangi kutu için sertifika istendiğini hafızaya alıyoruz
       sessionStorage.setItem('pending_cert_issue', state.mailbox.ref);
 
+      // HANGİ HESAPLA onaylanacağı açıkça yazılır. fitfak kimlikte birden
+      // fazla hesap açık olabiliyor ve onay ekranında yanlış hesabı seçmek,
+      // sertifikanın başkasına yazılmasına yol açıyordu. Sunucu artık bunu
+      // reddediyor; kullanıcının en baştan doğru hesabı seçmesi için de
+      // adresi burada gösteriyoruz.
+      const approveAs = err.detail && err.detail.approveAs;
       renderCertNote(
-        `${err.message} Sertifika alabilmek için fitfak kimlik hesabınızdan bir kez izin vermeniz gerekiyor.`,
+        `${err.message} Sertifika alabilmek için fitfak kimlik hesabınızdan bir kez izin vermeniz gerekiyor.`
+        + (approveAs ? ` Onayı <strong>${esc(approveAs)}</strong> hesabıyla verin.` : ''),
         'info',
         `<a class="btn btn-sm btn-primary" href="${esc(authorizeUrl)}">İzin ver ve dön</a>`,
       );

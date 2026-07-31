@@ -194,6 +194,7 @@ class MailPipeline {
         helo: envelope.heloName,
         spf: spfResult.result,
         spfDomain: spfResult.domain,
+        matchedDomain: spfResult.matchedDomain || undefined,
         mechanism: spfResult.mechanism,
         lookups: spfResult.lookups,
         explanation: spfResult.explanation,
@@ -316,6 +317,10 @@ class MailPipeline {
         spf: auth.spf ? {
           result: auth.spf.result,
           domain: auth.spf.domain,
+          // Hizalama `domain` ile yapılır; `matchedDomain` yalnızca "SPF
+          // nerede eşleşti" sorusunun cevabı (ör. gmail.com -> _spf.google.com).
+          matchedDomain: auth.spf.matchedDomain || null,
+          identity: auth.spf.identity || 'mailfrom',
           mechanism: auth.spf.mechanism || null,
           explanation: auth.spf.explanation || '',
         } : null,

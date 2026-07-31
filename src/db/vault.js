@@ -2,6 +2,8 @@
 
 const crypto = require('node:crypto');
 
+const { toBuffer, tryDecodeBase64 } = require('../util/bytes');
+
 /**
  * Anahtar kasası: sertifikalar, özel anahtarlar, DKIM ve VAPID anahtarları,
  * bildirim sırları, IdP jetonları.
@@ -24,6 +26,37 @@ const crypto = require('node:crypto');
 
 const STATUS = { PENDING: 'pending', ACTIVE: 'active', RETIRED: 'retired', COMPROMISED: 'compromised' };
 
+/**
+ * Zarf başlığı: `FMV1` || iv(12) || tag(16) || şifreli metin.
+ *
+ * ── BİLDİRİLEN HATA ──────────────────────────────────────────────────────
+ *   Error: Unsupported state or unable to authenticate data
+ *       at Decipheriv.final (node:internal/crypto/cipher)
+ *       at KeyVault._unwrap  ->  MailSigner.getDkimKey  ->  pipeline.send
+ *
+ * Yani DKIM anahtarı kasaya YAZILIYOR ama GERİ OKUNAMIYOR ve giden her posta
+ * 500 ile düşüyordu. AES-GCM'in bu hatası üç ayrı nedene çıkar ve üçünün
+ * çözümü farklıdır:
+ *
+ *   a) Kasa sırrı değişti  -> eski sır olmadan kayıt açılamaz.
+ *   b) Şifreli metin BOZULDU -> yedekten dönmek gerekir.
+ *   c) Şifreli metin SAĞLAM ama sürücüden FARKLI BİR ŞEKİLDE geri geldi
+ *      (Buffer yerine base64 dizge, ya da base64 metnin baytları) -> hiçbir
+ *      şey kaybolmamıştır, yalnızca doğru okunmamıştır.
+ *
+ * Uygulamada gerçekleşen (c) idi ve (b) gibi görünüyordu. Ayrım, tahminle
+ * yapılamaz — bu yüzden zarf artık KENDİNİ TANITIYOR: 4 baytlık `FMV1`
+ * imzası, değerin hangi şekilde geri geldiğinden bağımsız olarak "bu bir
+ * kasa zarfıdır ve şuradan başlar" diyor. İmza bulunamazsa değer bir kez de
+ * base64 metni olarak çözülüp tekrar bakılıyor; hâlâ yoksa kayıt eski
+ * biçimdedir ve doğrudan iv||tag||ct olarak okunuyor.
+ *
+ * (a) ve (b) ise artık BİRBİRİNDEN AYRI hata mesajları veriyor.
+ */
+const ENVELOPE_MAGIC = Buffer.from('FMV1', 'latin1');
+const IV_BYTES = 12;
+const TAG_BYTES = 16;
+
 class KeyVault {
   /**
    * @param {object} db      sürücü bağımsız veritabanı yüzeyi
@@ -45,35 +78,53 @@ class KeyVault {
   get collection() { return this.db.collection('secrets'); }
 
   _wrap(plaintext, aad) {
-    const iv = crypto.randomBytes(12);
+    const iv = crypto.randomBytes(IV_BYTES);
     const cipher = crypto.createCipheriv('aes-256-gcm', this.wrapKey, iv);
     cipher.setAAD(Buffer.from(aad, 'utf8'));
     const ct = Buffer.concat([cipher.update(plaintext), cipher.final()]);
-    return Buffer.concat([iv, cipher.getAuthTag(), ct]);
+    return Buffer.concat([ENVELOPE_MAGIC, iv, cipher.getAuthTag(), ct]);
   }
 
   /**
-   * @param {Buffer|object} envelope
-   * @param {string} aad
-   * @param {string} [wrapKeyId] kaydın sarıldığı anahtarın kimliği
+   * Sürücüden dönen değerden zarfın GÖVDESİNİ (iv||tag||ct) çıkarır.
+   *
+   * Üç şekil de aynı zarfı taşıyabilir ve üçü de burada aynı sonuca iner:
+   *   - Buffer/Uint8Array olarak `FMV1...`         (beklenen)
+   *   - base64 DİZGE olarak `"Rk1WMQ..."`          (JSON köprüsü)
+   *   - base64 metnin BAYTLARI `0x52 0x6b 0x31...` (dizge -> bytes çeviren sürücü)
    */
-  _unwrap(envelope, aad, wrapKeyId = null) {
-    let buf;
-    
-    // Ağ katmanından gelen verinin tipine göre orijinal baytlara (Buffer) dönüştür
-    if (Buffer.isBuffer(envelope)) {
-      buf = envelope;
-    } else if (typeof envelope === 'string') {
-      // gRPC/JSON binary veriyi Base64 string olarak iletiyorsa, decode ederek almalıyız
-      buf = Buffer.from(envelope, 'base64');
-    } else if (envelope && envelope.type === 'Buffer' && Array.isArray(envelope.data)) {
-      // Standart Node.js JSON.stringify Buffer formatıysa
-      buf = Buffer.from(envelope.data);
-    } else {
-      buf = Buffer.from(envelope);
+  static _envelopeBody(value) {
+    const direct = toBuffer(value);
+    if (direct.length >= ENVELOPE_MAGIC.length
+      && direct.subarray(0, ENVELOPE_MAGIC.length).equals(ENVELOPE_MAGIC)) {
+      return { body: direct.subarray(ENVELOPE_MAGIC.length), legacy: false, reencoded: false };
     }
 
-    if (buf.length < 29) throw new Error('[vault] bozuk zarf');
+    const decoded = tryDecodeBase64(direct);
+    if (decoded && decoded.length >= ENVELOPE_MAGIC.length
+      && decoded.subarray(0, ENVELOPE_MAGIC.length).equals(ENVELOPE_MAGIC)) {
+      return { body: decoded.subarray(ENVELOPE_MAGIC.length), legacy: false, reencoded: true };
+    }
+
+    // İmza yok: `FMV1` öncesi yazılmış kayıt. Gövdenin kendisi zarftır.
+    // Dizge olarak gelmişse base64 çözümü eski davranışla aynı kalır.
+    if (typeof value === 'string') {
+      const asBase64 = Buffer.from(value, 'base64');
+      if (asBase64.length >= IV_BYTES + TAG_BYTES + 1) {
+        return { body: asBase64, legacy: true, reencoded: true };
+      }
+    }
+    return { body: direct, legacy: true, reencoded: false };
+  }
+
+  /**
+   * @param {Buffer|string|object} envelope
+   * @param {string} aad
+   * @param {string} [wrapKeyId] kaydın sarıldığı anahtarın kimliği
+   * @param {object} [context]   hata mesajına yazılacak kayıt bilgisi
+   */
+  _unwrap(envelope, aad, wrapKeyId = null, context = {}) {
+    const where = context.label ? ` (${context.label})` : '';
 
     // Anahtar uyuşmazlığı ÖNCE denetlenir. Aksi hâlde AES-GCM'in
     // "Unsupported state or unable to authenticate data" hatası çıkar ve o
@@ -81,23 +132,48 @@ class KeyVault {
     // açılmaya çalışılıyor. İkisi çok farklı sorunlar: biri yedekten geri
     // dönmeyi, diğeri doğru sırrı bulmayı gerektirir.
     if (wrapKeyId && wrapKeyId !== this.wrapKeyId) {
-      throw new Error(
-        `[vault] bu sır başka bir kasa anahtarıyla sarılmış `
+      const err = new Error(
+        `[vault] bu sır başka bir kasa anahtarıyla sarılmış${where} `
         + `(kayıt: ${wrapKeyId}, şu anki: ${this.wrapKeyId}). `
-        + 'FITFAK_MAIL_VAULT_SECRET değişmiş olabilir; eski sır olmadan bu kayıt açılamaz.',
+        + 'FITFAK_MAIL_VAULT_SECRET değişmiş olabilir; eski sır olmadan bu kayıt açılamaz. '
+        + 'Eski sır elinizdeyse `rewrapAll` ile yeniden sarın, yoksa bu sır yeniden üretilmelidir.',
       );
+      err.code = 'VAULT_KEY_MISMATCH';
+      throw err;
     }
 
-    const iv = buf.subarray(0, 12);
-    const tag = buf.subarray(12, 28);
-    const ct = buf.subarray(28);
+    const { body, legacy } = KeyVault._envelopeBody(envelope);
+    if (body.length < IV_BYTES + TAG_BYTES + 1) {
+      const err = new Error(`[vault] bozuk zarf${where}: ${body.length} bayt, en az ${IV_BYTES + TAG_BYTES + 1} bekleniyor`);
+      err.code = 'VAULT_ENVELOPE_INVALID';
+      throw err;
+    }
+
+    const iv = body.subarray(0, IV_BYTES);
+    const tag = body.subarray(IV_BYTES, IV_BYTES + TAG_BYTES);
+    const ct = body.subarray(IV_BYTES + TAG_BYTES);
     const decipher = crypto.createDecipheriv('aes-256-gcm', this.wrapKey, iv);
-    
+
     // AAD sır adını ve sürümünü bağlar: bir kaydın şifreli gövdesini başka
     // bir kaydın satırına taşımak doğrulamayı bozar.
     decipher.setAAD(Buffer.from(aad, 'utf8'));
     decipher.setAuthTag(tag);
-    return Buffer.concat([decipher.update(ct), decipher.final()]);
+    try {
+      return Buffer.concat([decipher.update(ct), decipher.final()]);
+    } catch (cause) {
+      // Buraya düşmek artık tek bir anlama geliyor: anahtar doğru,
+      // biçim doğru, ama doğrulama etiketi tutmadı.
+      const err = new Error(
+        `[vault] sır açılamadı${where}: kimlik doğrulama etiketi tutmadı. `
+        + (legacy
+          ? 'Kayıt eski (imzasız) biçimde; kasa sırrı bu kayıt yazıldıktan sonra değişmiş olabilir. '
+          : '')
+        + 'Kasa sırrı (FITFAK_MAIL_VAULT_SECRET) doğruysa kayıt bozulmuştur ve yeniden üretilmelidir.',
+      );
+      err.code = 'VAULT_DECRYPT_FAILED';
+      err.cause = cause;
+      throw err;
+    }
   }
 
   static aadFor(kind, name, version) { return `${kind}|${name}|v${version}`; }
@@ -124,24 +200,28 @@ class KeyVault {
    * @param {boolean} [p.activate=true]  doğrudan etkinleştir (false ise pending)
    * @param {number} [p.notAfter]
    */
-  async put({ kind, name, value, activate = true, notAfter = 0, contentType = 'application/octet-stream', meta = null, createdBySub = '' }) {
-    console.log(`\n[DEBUG-VAULT] === PUT (KASAYA YAZMA) ÇAĞRILDI ===`);
-    console.log(`[DEBUG-VAULT] Tür (kind): ${kind}`);
-    console.log(`[DEBUG-VAULT] Ad (name): ${name}`);
-    console.log(`[DEBUG-VAULT] Değer (Tip): ${typeof value} | Buffer Mı?: ${Buffer.isBuffer(value)}`);
-    if (value) {
-      const valBuf = Buffer.isBuffer(value) ? value : Buffer.from(String(value), 'utf8');
-      console.log(`[DEBUG-VAULT] Değer Boyutu: ${valBuf.length} bayt`);
-      console.log(`[DEBUG-VAULT] Değer "${valBuf.toString('utf8')}"`);
-    }
-    console.log(`[DEBUG-VAULT] Meta:`, meta);
-
+  async put({
+    kind, name, value, activate = true, notAfter = 0,
+    contentType = 'application/octet-stream', meta = null, createdBySub = '',
+    verify = true,
+  }) {
     if (!kind || !name) throw new Error('[vault] kind ve name zorunlu');
     const plaintext = Buffer.isBuffer(value) ? value : Buffer.from(String(value), 'utf8');
+    if (!plaintext.length) throw new Error(`[vault] boş sır yazılamaz: ${kind}`);
+
     const version = (await this._highestVersion(kind, name)) + 1;
     const secretKey = KeyVault.keyFor(kind, name, version);
-    const now = Date.now();
 
+    // Aynı ad için eşzamanlı iki `put`, aynı sürüm numarasını hesaplayıp iki
+    // kayıt yazabilir. Sürüm sayacı bir kilit değil; bu yüzden yazmadan önce
+    // anahtarın boş olduğu doğrulanıyor ve doluysa sürüm ilerletiliyor.
+    if (await this.collection.findOne('secretKey', secretKey)) {
+      return this.put({
+        kind, name, value, activate, notAfter, contentType, meta, createdBySub, verify,
+      });
+    }
+
+    const now = Date.now();
     const record = {
       secretKey,
       kind,
@@ -164,10 +244,36 @@ class KeyVault {
     };
     const id = await this.collection.insert(record);
 
-    console.log(record);
+    // GİDİŞ-DÖNÜŞ DENETİMİ. Yazdığımız zarfı veritabanından GERİ OKUYUP
+    // açıyoruz. Sürücü ikili alanı başka bir şekle çevirdiyse (dizge, base64,
+    // {type:'Buffer'}) burada anlaşılır; denetim olmadan bu, aylar sonra
+    // "eposta gönderilemiyor" olarak ve tamamen başka bir yerde patlıyordu.
+    if (verify) {
+      const stored = await this.collection.findOne('secretKey', secretKey);
+      if (!stored) {
+        throw new Error(`[vault] sır yazıldı ama geri okunamadı: ${kind} v${version}`);
+      }
+      const roundTrip = this._unwrap(
+        stored.ciphertext,
+        KeyVault.aadFor(kind, name, version),
+        stored.wrapKeyId,
+        { label: `${kind} v${version}` },
+      );
+      if (!roundTrip.equals(plaintext)) {
+        throw new Error(
+          `[vault] gidiş-dönüş denetimi başarısız: ${kind} v${version}. `
+          + 'Veritabanı sürücüsü ikili alanı olduğu gibi geri döndürmüyor.',
+        );
+      }
+    }
 
     if (activate) await this._retireOthers(kind, name, version);
-    if (this.logger) this.logger.info({ kind, version, msg: 'kasaya sır yazıldı' });
+    if (this.logger) {
+      this.logger.info({
+        kind, version, status: record.status, bytes: plaintext.length,
+        sha256: record.sha256Hex.slice(0, 12), msg: 'kasaya sır yazıldı',
+      });
+    }
     return { id, version, status: record.status };
   }
 
@@ -214,7 +320,12 @@ class KeyVault {
     if (row.status === STATUS.COMPROMISED) {
       throw new Error(`[vault] sır ele geçmiş olarak işaretli: ${kind}/${name} v${row.version}`);
     }
-    const value = this._unwrap(row.ciphertext, KeyVault.aadFor(row.kind, row.name, Number(row.version)), row.wrapKeyId);
+    const value = this._unwrap(
+      row.ciphertext,
+      KeyVault.aadFor(row.kind, row.name, Number(row.version)),
+      row.wrapKeyId,
+      { label: `${row.kind} v${row.version}` },
+    );
     return {
       id: String(row._id),
       kind: row.kind,
@@ -240,7 +351,12 @@ class KeyVault {
         out.push({
           version: Number(row.version),
           status: row.status,
-          value: this._unwrap(row.ciphertext, KeyVault.aadFor(row.kind, row.name, Number(row.version)), row.wrapKeyId),
+          value: this._unwrap(
+            row.ciphertext,
+            KeyVault.aadFor(row.kind, row.name, Number(row.version)),
+            row.wrapKeyId,
+            { label: `${row.kind} v${row.version}` },
+          ),
           createdAt: Number(row.createdAt || 0),
         });
       } catch (err) {
@@ -275,6 +391,50 @@ class KeyVault {
         kind: r.kind, name: r.name, version: Number(r.version), status: r.status,
         notAfter: Number(r.notAfter), expiresInMs: Number(r.notAfter) - now,
       }));
+  }
+
+  /**
+   * Kasanın sağlık durumu: her kayıt AÇILABİLİYOR MU?
+   *
+   * "Yazma çalışıyor ama okuma çalışıyor mu emin değilim" sorusunun tek
+   * dürüst cevabı, kayıtları gerçekten açmayı denemektir. Değerler DÖNMEZ,
+   * yalnızca açılıp açılamadığı ve açılamıyorsa NEDENİ.
+   */
+  async diagnose({ kinds = null } = {}) {
+    const out = { total: 0, ok: 0, failed: 0, byKind: {}, problems: [] };
+    for await (const row of this.collection.scan()) {
+      if (kinds && !kinds.includes(row.kind)) continue;
+      out.total++;
+      const kind = row.kind || 'bilinmiyor';
+      out.byKind[kind] = out.byKind[kind] || { ok: 0, failed: 0 };
+      try {
+        const value = this._unwrap(
+          row.ciphertext,
+          KeyVault.aadFor(row.kind, row.name, Number(row.version)),
+          row.wrapKeyId,
+          { label: `${row.kind} v${row.version}` },
+        );
+        const digest = crypto.createHash('sha256').update(value).digest('hex');
+        if (row.sha256Hex && digest !== row.sha256Hex) {
+          throw Object.assign(new Error('[vault] açılan değerin özeti kayıttakiyle uyuşmuyor'), {
+            code: 'VAULT_DIGEST_MISMATCH',
+          });
+        }
+        out.ok++;
+        out.byKind[kind].ok++;
+      } catch (err) {
+        out.failed++;
+        out.byKind[kind].failed++;
+        out.problems.push({
+          kind: row.kind,
+          version: Number(row.version || 0),
+          status: row.status,
+          code: err.code || 'UNKNOWN',
+          error: err.message,
+        });
+      }
+    }
+    return out;
   }
 
   /** Türe göre listeleme — ADA göre listeleme YOKTUR (ad kör dizinde). */
@@ -322,13 +482,13 @@ class KeyVault {
     for await (const row of this.collection.scan()) {
       if (row.wrapKeyId === nextKeyId) continue;
       const aad = KeyVault.aadFor(row.kind, row.name, Number(row.version));
-      const plaintext = this._unwrap(row.ciphertext, aad, row.wrapKeyId);
-      const iv = crypto.randomBytes(12);
+      const plaintext = this._unwrap(row.ciphertext, aad, row.wrapKeyId, { label: `${row.kind} v${row.version}` });
+      const iv = crypto.randomBytes(IV_BYTES);
       const cipher = crypto.createCipheriv('aes-256-gcm', nextKey, iv);
       cipher.setAAD(Buffer.from(aad, 'utf8'));
       const ct = Buffer.concat([cipher.update(plaintext), cipher.final()]);
       await this.collection.update(String(row._id), {
-        ciphertext: Buffer.concat([iv, cipher.getAuthTag(), ct]),
+        ciphertext: Buffer.concat([ENVELOPE_MAGIC, iv, cipher.getAuthTag(), ct]),
         wrapKeyId: nextKeyId,
         rotatedAt: Date.now(),
       });

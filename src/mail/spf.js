@@ -412,7 +412,28 @@ async function check({ ip, sender = '', heloDomain = '', resolver = dnsModule.pr
     const outcome = await evaluateDomain(evaluation, domain);
     return {
       result: outcome.result,
-      domain: outcome.domain,
+      // ── BİLDİRİLEN HATA: her Gmail iletisi dmarc=fail ───────────────────
+      //
+      // Burası `outcome.domain` döndürüyordu: mekanizmanın EŞLEŞTİĞİ alan
+      // adı. gmail.com'un kaydı `redirect=_spf.google.com` olduğu için
+      // eşleşme orada oluyor ve sonuç `_spf.google.com` diye dönüyordu.
+      // Başlıkta da öyle görünüyordu:
+      //
+      //     spf=pass smtp.mailfrom=_spf.google.com
+      //
+      // DMARC hizalaması ise From alan adını SPF'in doğruladığı KİMLİĞİN
+      // alan adıyla karşılaştırır (RFC 7489 §3.1.1) — o kimlik MAIL FROM'dur,
+      // yani `gmail.com`. `_spf.google.com` ile karşılaştırıldığında hizalama
+      // hiçbir zaman tutmuyor, SPF geçmiş olmasına rağmen DMARC düşüyordu.
+      // Bu yalnızca Gmail'i değil, `redirect`/`include` kullanan HER büyük
+      // sağlayıcıyı (Outlook, Yahoo, Amazon SES…) etkiliyordu.
+      //
+      // Doğrusu: doğrulanan kimliğin alan adı, yani başlangıçta sorulan alan.
+      domain,
+      // Eşleşmenin nerede olduğu tanı için değerli, ama HİZALAMA için değil.
+      matchedDomain: outcome.domain,
+      redirectedFrom: outcome.redirectedFrom || null,
+      identity: sender ? 'mailfrom' : 'helo',
       mechanism: outcome.matched,
       explanation: outcome.record || '',
       lookups: evaluation.lookups,
@@ -423,6 +444,9 @@ async function check({ ip, sender = '', heloDomain = '', resolver = dnsModule.pr
     return {
       result,
       domain,
+      matchedDomain: null,
+      redirectedFrom: null,
+      identity: sender ? 'mailfrom' : 'helo',
       mechanism: null,
       explanation: err.message,
       lookups: evaluation.lookups,

@@ -405,6 +405,40 @@ const HTTP_CFG = {
   // al (geliştirmede kapatılır).
   cacheStatic: bool('FITFAK_HTTP_CACHE_STATIC', 'http.cacheStatic', IS_PROD),
   sessionCookieName: pick('FITFAK_SESSION_COOKIE', 'http.sessionCookieName', 'fitfak_mail_sid'),
+  /* ── İÇERİK GÜVENLİK POLİTİKASI (CSP) ─────────────────────────────────
+     ── BİLDİRİLEN HATA ────────────────────────────────────────────────
+       (index):238 Executing inline script violates … 'script-src 'self''
+       (index):1   Loading the script
+                   'https://static.cloudflareinsights.com/beacon.min.js/v45132…'
+                   violates … "script-src 'self'"
+
+     İkisi de BİZİM kodumuz değil. Cloudflare, Web Analytics (Browser
+     Insights) açıkken HTML yanıtına `</body>` etiketinden hemen önce bir
+     betik enjekte ediyor: bir satır içi parçacık ve bir de harici
+     `beacon.min.js`. `public/webmail/index.html` 237 satır; tarayıcının
+     "238. satırdaki satır içi betik" dediği şey tam olarak o enjeksiyon.
+
+     Üç seçenek var ve üçü de burada yapılandırılabilir:
+
+       1. Cloudflare panelinde Web Analytics'i kapatmak — en temizi, çünkü
+          o zaman politikayı gevşetmeye gerek kalmaz.
+       2. Beacon'a izin vermek (öntanımlı davranış): kaynak izni + satır
+          içi parçacığın SHA-256 özeti. Özet, `'unsafe-inline'` yerine
+          kullanılıyor; `'unsafe-inline'` bütün satır içi betikleri açardı
+          ve webmail'de bir XSS'in çalışması için gereken tek şey odur.
+       3. `FITFAK_HTTP_CSP_SCRIPT_EXTRA=''` ile listeyi boşaltmak.
+
+     Özet Cloudflare parçacığı değiştiğinde eskir; o yüzden ayar
+     değiştirilebilir ve eskimesi yalnızca konsolda bir uyarı üretir,
+     sayfayı bozmaz. */
+  cspScriptExtra: list('FITFAK_HTTP_CSP_SCRIPT_EXTRA', 'http.cspScriptExtra', [
+    'https://static.cloudflareinsights.com',
+    "'sha256-wCTYAN28EakRHUoy3+2xBsRILoOO9GxTSdjrVnbybfA='",
+  ]),
+  cspConnectExtra: list('FITFAK_HTTP_CSP_CONNECT_EXTRA', 'http.cspConnectExtra', [
+    'https://cloudflareinsights.com',
+    'https://static.cloudflareinsights.com',
+  ]),
   // Çerezler cloudflared TLS'i sonlandırdığı için Secure işaretlenir; yerel
   // düz HTTP geliştirmede kapatılabilir.
   secureCookies: bool('FITFAK_SECURE_COOKIES', 'http.secureCookies', true),
