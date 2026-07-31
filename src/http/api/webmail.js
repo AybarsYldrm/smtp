@@ -218,15 +218,57 @@ function registerWebmailRoutes(router, deps) {
     });
   });
 
+  /**
+   * Ham ileti kaynağı.
+   *
+   * Üç biçim, üç ayrı ihtiyaç:
+   *   - `?format=text` (öntanımlı): tarayıcıda OKUNUR. `message/rfc822`
+   *     göndermek tarayıcıyı dosyayı indirmeye zorluyordu; "kaynağı gör"
+   *     bağlantısı bu yüzden hiçbir şey göstermiyordu, indiriyordu.
+   *   - `?format=eml`: indirme (posta istemcisine aktarmak, arşivlemek).
+   *   - `?format=json`: arayüzün kaynak panelinde göstereceği biçim,
+   *     doğrulama izi ve başlık listesiyle birlikte.
+   *
+   * Her biçimde `Content-Security-Policy: sandbox` var: ham ileti HTML
+   * içerebiliyor ve tarayıcı onu kendi kaynağımızda çalıştırmamalı.
+   */
   router.get('/api/v1/messages/:ref/raw', async (ctx) => {
     const session = await requireSession(ctx);
-    const message = await stores.messages.get(ctx.params.ref);
+    const message = await stores.messages.getFull(ctx.params.ref);
     if (!message) throw new HttpError(404, 'İleti bulunamadı');
     await resolveMailbox(ctx, session, message.mailboxRef);
 
     const raw = await stores.messages.getRaw(ctx.params.ref);
-    if (!raw) throw new HttpError(404, 'Ham ileti saklanmamış');
-    ctx.send(200, raw, 'message/rfc822');
+    if (!raw) throw new HttpError(404, 'Ham ileti saklanmamış', { code: 'RAW_NOT_STORED' });
+
+    const format = String(ctx.query.get('format') || 'text');
+    ctx.setHeader('x-content-type-options', 'nosniff');
+    ctx.setHeader('content-security-policy', "default-src 'none'; sandbox");
+
+    if (format === 'json') {
+      const text = raw.toString('utf8');
+      const split = text.search(/\r?\n\r?\n/);
+      ctx.json(200, {
+        ref: message.ref,
+        sizeBytes: raw.length,
+        headers: split === -1 ? text : text.slice(0, split),
+        body: split === -1 ? '' : text.slice(split).replace(/^\r?\n\r?\n/, ''),
+        raw: text,
+        authResults: message.authResults || null,
+        smime: message.smimeStatus ? { status: message.smimeStatus, signer: message.smimeSigner || null } : null,
+        spamScore: message.spamScore ?? null,
+      });
+      return;
+    }
+
+    if (format === 'eml') {
+      const name = safeFileName(`${(message.subject || 'ileti').slice(0, 60)}.eml`);
+      ctx.setHeader('content-disposition', `attachment; filename="${name}"`);
+      ctx.send(200, raw, 'message/rfc822');
+      return;
+    }
+
+    ctx.send(200, raw, 'text/plain; charset=utf-8');
   });
 
   /** Ek indirme: kısa ömürlü jeton + açık oturum, ikisi birden. */
@@ -337,6 +379,58 @@ function registerWebmailRoutes(router, deps) {
     }
     realtime.publishUpdate(mailbox.ref, { messageRef: ctx.params.ref, deleted: true, permanent });
     ctx.json(200, { ok: true, permanent });
+  });
+
+  /**
+   * İstenmeyen / istenmeyen değil.
+   *
+   * `move` ile klasör değiştirmekten AYRI bir uç nokta, çünkü karar
+   * yalnızca bu iletiyi değil GÖNDERENİ de ilgilendiriyor: kullanıcı bir
+   * adresi "istenmeyen değil" diye işaretlediğinde, aynı adresten gelen
+   * sonraki iletilerin de puanı düşmeli. Aksi hâlde kullanıcı aynı işareti
+   * her hafta yeniden koyuyor ve sistem hiçbir şey öğrenmiyor.
+   *
+   * Karar kutu başına saklanıyor: bir kullanıcının "istenmeyen" dediği
+   * gönderen, başka bir kullanıcının beklediği gönderen olabilir.
+   */
+  router.post('/api/v1/messages/:ref/spam', async (ctx) => {
+    const session = await requireSession(ctx);
+    ctx.state.input = await ctx.input();
+    requireCsrf(ctx, session);
+    const message = await stores.messages.getFull(ctx.params.ref);
+    if (!message) throw new HttpError(404, 'İleti bulunamadı');
+    const { mailbox } = await resolveMailbox(ctx, session, message.mailboxRef, 'delegate');
+
+    const isSpam = ctx.state.input.fields.spam == null ? true : toBool(ctx.state.input.fields.spam);
+    const sender = normalizeAddress((message.from && message.from.address) || message.envelopeFrom || '');
+    const folder = isSpam ? 'spam' : 'inbox';
+
+    await stores.messages.move(message.ref, folder);
+    if (isSpam) await stores.messages.setFlags(message.ref, { seen: true });
+
+    let verdictSaved = false;
+    if (sender) {
+      // Kutunun süzme kuralları listesine gönderen bazlı bir karar yazılır.
+      // Kural motoru zaten `fromEquals` destekliyor (bkz. chooseFolder);
+      // ayrı bir mekanizma icat etmek yerine onu besliyoruz.
+      const rules = (mailbox.filterRules || []).filter((r) => normalizeAddress(r.fromEquals || '') !== sender);
+      rules.push({ fromEquals: sender, folder, source: 'user', at: Date.now() });
+      await stores.mailboxes.ensure(mailbox.address, { filterRules: rules.slice(-200) });
+      verdictSaved = true;
+    }
+
+    await stores.audit.record({
+      actorSub: session.idpSub, actorEmail: session.idpEmail,
+      action: isSpam ? 'message.mark_spam' : 'message.mark_not_spam',
+      targetType: 'message', targetId: message.ref, ip: ctx.ip,
+      detail: { sender, folder },
+    });
+    logger.info({
+      mailbox: mailbox.address, sender, folder, msg: isSpam ? 'istenmeyen olarak işaretlendi' : 'istenmeyen değil olarak işaretlendi',
+    });
+
+    realtime.publishUpdate(mailbox.ref, { messageRef: message.ref, folder });
+    ctx.json(200, { ok: true, folder, sender, verdictSaved });
   });
 
   router.post('/api/v1/mailboxes/:mailbox/read-all', async (ctx) => {

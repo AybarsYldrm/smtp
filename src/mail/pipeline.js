@@ -25,6 +25,19 @@ const { normalizeAddress, splitAddress, sha256Hex } = require('../util/encoding'
  *   2. AKTARMA (RELAY) KAPALI. 25 portu yalnızca yerel alanlara teslim eder.
  *      Açık aktarma, alan adının itibarını saatler içinde bitirir.
  */
+// RFC 5321 §6.3 en az 100 önerir; biz daha erken duruyoruz çünkü kendi
+// alanlarımız arasında bu kadar sıçrama meşru bir yol değil.
+const MAX_RECEIVED_HOPS = 25;
+
+/** Ham iletideki Received başlıklarını sayar (başlık bloğuyla sınırlı). */
+function countReceivedHeaders(raw) {
+  const text = (Buffer.isBuffer(raw) ? raw : Buffer.from(String(raw))).toString('latin1');
+  const end = text.search(/\r?\n\r?\n/);
+  const headerBlock = end === -1 ? text : text.slice(0, end);
+  const matches = headerBlock.match(/^received:/gim);
+  return matches ? matches.length : 0;
+}
+
 class MailPipeline {
   constructor({ config, logger, stores, signer, queue = null, notifier = null, realtime = null }) {
     this.config = config;
@@ -133,11 +146,20 @@ class MailPipeline {
     return { reply: `250 2.0.0 Kabul edildi (${results.filter((r) => r.ok).length} alıcı)` };
   }
 
-  /** SPF + DKIM + DMARC + S/MIME değerlendirmesi. */
+  /**
+   * SPF + DKIM + DMARC + S/MIME değerlendirmesi.
+   *
+   * Sonuçlar her zaman AYRINTILI kaydedilir. "DKIM fail" tek başına
+   * eyleme dönüşmüyor: gövde özeti mi tutmadı, DNS'te anahtar mı yok,
+   * yoksa aradaki bir sunucu başlık mı değiştirdi — üçü farklı sorunlar.
+   * Bu satır olmadan, gelen bir iletinin neden başarısız olduğu ancak
+   * iletiyi tekrar üretip elle denenerek anlaşılabiliyordu.
+   */
   async evaluateAuthentication({ raw, parsed, envelope }) {
     if (!this.config.smtp.inboundChecks) return { enabled: false };
 
     const out = { enabled: true, spf: null, dkim: null, dmarc: null, smime: null, iprev: null };
+    const done = this.logger.timer('gelen doğrulama');
 
     const [spfResult, dkimResult] = await Promise.all([
       spf.check({
@@ -146,7 +168,7 @@ class MailPipeline {
         heloDomain: envelope.heloName || '',
         resolver: this.resolver,
       }).catch((err) => ({ result: 'temperror', domain: '', explanation: err.message })),
-      dkim.verifyMessage(raw, { resolver: this.resolver })
+      dkim.verifyMessage(raw, { resolver: this.resolver, diagnostics: true })
         .catch((err) => ({ results: [], overall: 'temperror', reason: err.message })),
     ]);
     out.spf = spfResult;
@@ -157,7 +179,55 @@ class MailPipeline {
       out.dmarc = await dmarc.evaluate({
         fromDomain, spf: spfResult, dkim: dkimResult, resolver: this.resolver,
       }).catch((err) => ({ result: 'temperror', disposition: 'none', reason: err.message, alignment: {} }));
+    } else {
+      this.logger.warn({
+        remoteIp: envelope.remoteIp, mailFrom: envelope.mailFrom,
+        msg: 'From başlığı çözümlenemedi — DMARC değerlendirilemiyor',
+      });
     }
+
+    // Başarısız her doğrulama, NEDENİYLE birlikte kayda geçer.
+    if (spfResult.result !== 'pass') {
+      this.logger.debug({
+        remoteIp: envelope.remoteIp,
+        mailFrom: envelope.mailFrom,
+        helo: envelope.heloName,
+        spf: spfResult.result,
+        spfDomain: spfResult.domain,
+        mechanism: spfResult.mechanism,
+        lookups: spfResult.lookups,
+        explanation: spfResult.explanation,
+        msg: 'SPF geçmedi',
+      });
+    }
+    for (const signature of dkimResult.results || []) {
+      if (signature.result === 'pass') continue;
+      this.logger.debug({
+        d: signature.domain,
+        s: signature.selector,
+        a: signature.algorithm,
+        result: signature.result,
+        bodyHashMatch: signature.bodyHashMatch,
+        reason: signature.reason,
+        detail: signature.detail || undefined,
+        msg: 'DKIM imzası geçmedi',
+      });
+    }
+    if (out.dmarc && out.dmarc.result !== 'pass') {
+      this.logger.debug({
+        fromDomain,
+        dmarc: out.dmarc.result,
+        disposition: out.dmarc.disposition,
+        alignment: out.dmarc.alignment,
+        reason: out.dmarc.reason,
+        msg: 'DMARC geçmedi',
+      });
+    }
+    done({
+      spf: spfResult.result,
+      dkim: dkimResult.overall,
+      dmarc: out.dmarc ? out.dmarc.result : 'skip',
+    });
 
     if (parsed.signedContent && parsed.signaturePart) {
       try {
@@ -243,10 +313,25 @@ class MailPipeline {
       envelopeTo: recipient.address,
       remoteIp: envelope.remoteIp,
       authResults: auth.enabled ? {
-        spf: auth.spf ? { result: auth.spf.result, domain: auth.spf.domain } : null,
-        dkim: auth.dkim ? { overall: auth.dkim.overall, signatures: auth.dkim.results } : null,
+        spf: auth.spf ? {
+          result: auth.spf.result,
+          domain: auth.spf.domain,
+          mechanism: auth.spf.mechanism || null,
+          explanation: auth.spf.explanation || '',
+        } : null,
+        dkim: auth.dkim ? {
+          overall: auth.dkim.overall,
+          reason: auth.dkim.reason || null,
+          signatures: auth.dkim.results,
+        } : null,
         dmarc: auth.dmarc ? {
-          result: auth.dmarc.result, disposition: auth.dmarc.disposition, alignment: auth.dmarc.alignment,
+          result: auth.dmarc.result,
+          disposition: auth.dmarc.disposition,
+          alignment: auth.dmarc.alignment,
+          reason: auth.dmarc.reason || null,
+          policy: auth.dmarc.policy
+            ? { p: auth.dmarc.policy.effectivePolicy || auth.dmarc.policy.policy, foundAt: auth.dmarc.policy.foundAt }
+            : null,
         } : null,
       } : null,
       smime: auth.smime,
@@ -335,14 +420,74 @@ class MailPipeline {
    * bir adres kullanılır — aksi hâlde yönlendirilen her ileti alıcıda SPF
    * hatası verir (klasik yönlendirme sorunu). Özgün gönderen Reply-To'da
    * korunur.
+   *
+   * ── DÖNGÜ KORUMASI ─────────────────────────────────────────────────────
+   * Bir yönlendirme hedefi, iletiyi GÖNDEREN adres olabiliyor. Örnek:
+   * gmail'den gelen bir posta, hedefi yine o gmail adresi olan bir kutuya
+   * düşerse, gelen ileti göndericisine geri gider — "gmail'in gönderdiğini
+   * gmail'e atmak" tam olarak budur. Karşı taraf onu yeni bir ileti olarak
+   * kabul edip kendi kuralını uygularsa iki sunucu arasında sonsuz bir
+   * çember oluşur.
+   *
+   * Üç ayrı kapı var ve üçü de farklı bir yolu kesiyor:
+   *   1. Hedef, zarf göndereni ya da From adresiyle aynıysa gönderme.
+   *   2. İleti zaten bizim tarafımızdan yönlendirilmişse (X-Fitfak-Forwarded)
+   *      tekrar yönlendirme — iki kutu birbirine yönlendirilmiş olabilir.
+   *   3. Received zinciri çok uzunsa dur: bu, bir yerde bir çember olduğunun
+   *      taşıma katmanındaki karşılığı (RFC 5321 §6.3).
    */
   async applyForwarding({ mailbox, raw, parsed, envelope }) {
     const targets = (mailbox.forwardTo || []).map(normalizeAddress).filter(Boolean);
     if (!targets.length || !this.queue) return;
 
+    if (parsed.headers && parsed.headers['x-fitfak-forwarded']) {
+      this.logger.warn({
+        mailbox: mailbox.address,
+        msg: 'ileti zaten yönlendirilmiş, ikinci kez yönlendirilmiyor (döngü koruması)',
+      });
+      return;
+    }
+    const receivedCount = countReceivedHeaders(raw);
+    if (receivedCount > MAX_RECEIVED_HOPS) {
+      this.logger.error({
+        mailbox: mailbox.address, receivedCount,
+        msg: 'Received zinciri çok uzun, yönlendirme durduruldu (posta döngüsü)',
+      });
+      return;
+    }
+
+    // Otomatik üretilmiş posta yönlendirilmez (RFC 3834): bir "ofis dışındayım"
+    // yanıtını yönlendirmek, karşı tarafın otomatik yanıtını tetikleyebilir.
+    if (/auto-(generated|replied)/i.test(parsed.autoSubmitted || '')
+      || /^(bulk|junk|list)$/i.test(parsed.precedence || '')) {
+      this.logger.debug({
+        mailbox: mailbox.address, autoSubmitted: parsed.autoSubmitted, precedence: parsed.precedence,
+        msg: 'otomatik ileti yönlendirilmedi',
+      });
+      return;
+    }
+
+    const originators = new Set([
+      normalizeAddress(envelope.mailFrom || ''),
+      normalizeAddress(parsed.from && parsed.from.address),
+      normalizeAddress(parsed.replyTo),
+      normalizeAddress(mailbox.address),
+    ].filter(Boolean));
+
     for (const target of targets) {
+      if (originators.has(target)) {
+        this.logger.warn({
+          mailbox: mailbox.address, to: target,
+          msg: 'yönlendirme hedefi iletinin göndereni — atlandı (döngü koruması)',
+        });
+        continue;
+      }
       try {
-        const signed = await this.signer.signDkim(raw, { fromAddress: mailbox.address });
+        const marked = Buffer.concat([
+          Buffer.from(`X-Fitfak-Forwarded: ${mailbox.address}\r\n`, 'utf8'),
+          raw,
+        ]);
+        const signed = await this.signer.signDkim(marked, { fromAddress: mailbox.address });
         await this.queue.enqueue({
           rawBuffer: signed.rawMessage,
           envelopeFrom: `${this.config.queue.bounceMailbox}`,

@@ -275,13 +275,17 @@ async function defaultKeyLookup(selector, domain, { resolver = dns } = {}) {
  * @returns {Promise<{results: Array, overall: string}>}
  *   overall: 'pass' | 'fail' | 'none' | 'temperror' | 'permerror'
  */
-async function verifyMessage(rawMessage, { keyLookup = null, resolver = dns, maxSignatures = 5, now = Date.now() } = {}) {
+async function verifyMessage(rawMessage, {
+  keyLookup = null, resolver = dns, maxSignatures = 5, now = Date.now(), diagnostics = false,
+} = {}) {
   const rawBuf = Buffer.isBuffer(rawMessage) ? rawMessage : Buffer.from(String(rawMessage), 'utf8');
   const { headers: headerList, body } = splitMessage(rawBuf);
   const lookup = keyLookup || ((s, d) => defaultKeyLookup(s, d, { resolver }));
 
   const signatures = headerList.filter((h) => h.name === 'dkim-signature').slice(0, maxSignatures);
-  if (!signatures.length) return { results: [], overall: 'none' };
+  if (!signatures.length) {
+    return { results: [], overall: 'none', reason: 'iletide DKIM-Signature başlığı yok' };
+  }
 
   const results = [];
   for (const sigHeader of signatures) {
@@ -296,6 +300,23 @@ async function verifyMessage(rawMessage, { keyLookup = null, resolver = dns, max
       reason: null,
       bodyHashMatch: false,
     };
+    // Tanı bilgisi: bir imza neden geçmedi sorusu, "fail" kelimesiyle
+    // cevaplanamıyor. Gövde özeti mi tutmadı, imza mı tutmadı, anahtar mı
+    // bulunamadı — üçü tamamen farklı sorunlar ve farklı yerlere bakmayı
+    // gerektiriyorlar.
+    const detail = {
+      canonicalization: tags.c || 'simple/simple',
+      signedHeaders: [],
+      declaredBodyHash: tags.bh || '',
+      computedBodyHash: '',
+      bodyLengthTag: tags.l != null ? Number(tags.l) : null,
+      dnsName: tags.s && tags.d ? `${tags.s}._domainkey.${tags.d}` : '',
+      dnsRecordFound: false,
+      signingInputBytes: 0,
+      timestamp: tags.t ? Number(tags.t) : null,
+      expires: tags.x ? Number(tags.x) : null,
+    };
+    if (diagnostics) entry.detail = detail;
 
     try {
       if (tags.v !== '1') throw failPerm('sürüm 1 değil');
@@ -303,6 +324,9 @@ async function verifyMessage(rawMessage, { keyLookup = null, resolver = dns, max
       if (!spec) throw failPerm(`desteklenmeyen algoritma: ${tags.a}`);
       if (!tags.d || !tags.s || !tags.b || !tags.bh || !tags.h) throw failPerm('eksik etiket');
       if (tags.x && Number(tags.x) * 1000 < now) throw failPerm('imza süresi dolmuş');
+      // x= her zaman t='den SONRA olmalı (§3.5). Tersi, imzalayanın kendi
+      // imzasını doğmadan geçersiz ilan etmesi demek ve kayıt bozuktur.
+      if (tags.x && tags.t && Number(tags.x) < Number(tags.t)) throw failPerm('x= etiketi t= değerinden küçük');
 
       // i= etiketi d= alanının altında olmak zorunda; olmazsa imza başka bir
       // alan adına ait bir kimliği iddia ediyor.
@@ -316,12 +340,29 @@ async function verifyMessage(rawMessage, { keyLookup = null, resolver = dns, max
       const [headerCanon = 'simple', bodyCanon = 'simple'] = String(tags.c || 'simple/simple').split('/');
       const lengthLimit = tags.l != null && tags.l !== '' ? Number(tags.l) : null;
 
+      // `l=` gövdenin YALNIZCA ilk n sekizlisinin imzalandığını söyler. Bildirilen
+      // uzunluk gerçek gövdeden büyükse imza doğrulanamaz (§3.7): aradaki fark,
+      // imzalanmış ama teslim edilmemiş bayt demektir ve neyin imzalandığı
+      // belirsizleşir. Kısaltıp geçmek, eksik gövdeyi imzalı saymak olurdu.
+      const canonicalBody = canonicalizeBody(body, bodyCanon);
+      if (lengthLimit != null && lengthLimit > canonicalBody.length) {
+        throw failFail(`l= etiketi gövdeden uzun (${lengthLimit} > ${canonicalBody.length})`);
+      }
+
       const computedBh = bodyHash(body, { canon: bodyCanon, hash: spec.hash, lengthLimit });
+      detail.computedBodyHash = computedBh;
       entry.bodyHashMatch = computedBh === tags.bh;
-      if (!entry.bodyHashMatch) throw failFail('gövde özeti uyuşmuyor');
+      if (!entry.bodyHashMatch) {
+        throw failFail(
+          `gövde özeti uyuşmuyor (beklenen ${String(tags.bh).slice(0, 12)}…, `
+          + `hesaplanan ${computedBh.slice(0, 12)}…, kanoniklik ${bodyCanon}, `
+          + `${canonicalBody.length} bayt) — gövde aktarım sırasında değişmiş olabilir`,
+        );
+      }
 
       const hNames = String(tags.h).toLowerCase().split(':').map((s) => s.trim()).filter(Boolean);
       if (!hNames.includes('from')) throw failPerm('h= listesinde from yok');
+      detail.signedHeaders = hNames;
 
       const remaining = new Map();
       for (const h of headerList) {
@@ -342,13 +383,35 @@ async function verifyMessage(rawMessage, { keyLookup = null, resolver = dns, max
       parts.push(canonHeader(selfRaw));
 
       const signingInput = Buffer.from(parts.join(CRLF), 'binary');
+      detail.signingInputBytes = signingInput.length;
 
-      const txtRecords = await lookup(tags.s, tags.d).catch((err) => { throw failTemp(`DNS: ${err.message}`); });
+      const txtRecords = await lookup(tags.s, tags.d).catch((err) => {
+        throw failTemp(`${detail.dnsName} sorgulanamadı: ${err.code || err.message}`);
+      });
+      if (!txtRecords || !txtRecords.length) {
+        throw failPerm(`${detail.dnsName} için TXT kaydı yok — imzalayan alan anahtarı yayımlamıyor`);
+      }
+      detail.dnsRecordFound = true;
+
       const keyRecord = pickKeyRecord(txtRecords, tags.a);
-      if (!keyRecord) throw failPerm('DNS kaydında kullanılabilir anahtar yok');
+      if (!keyRecord) {
+        throw failPerm(
+          `${detail.dnsName} kaydında ${tags.a} ile kullanılabilir anahtar yok `
+          + `(${txtRecords.length} kayıt bulundu)`,
+        );
+      }
+      // Anahtar kaydı hangi özet algoritmalarına izin verdiğini yazabilir
+      // (h=sha256). Listede olmayan bir özetle üretilmiş imza reddedilir:
+      // alan sahibi sha1'i kapatmışsa ona uymak gerekir.
+      if (keyRecord.h) {
+        const allowed = String(keyRecord.h).toLowerCase().split(':').map((s) => s.trim()).filter(Boolean);
+        if (allowed.length && !allowed.includes(spec.hash)) {
+          throw failPerm(`anahtar kaydı ${spec.hash} özetine izin vermiyor (h=${keyRecord.h})`);
+        }
+      }
 
       const publicKey = buildPublicKey(keyRecord, spec.keyType);
-      if (!publicKey) throw failPerm('açık anahtar okunamadı');
+      if (!publicKey) throw failPerm('DNS kaydındaki açık anahtar okunamadı (p= bozuk olabilir)');
 
       const sigBytes = Buffer.from(tags.b, 'base64');
       const ok = spec.keyType === 'ed25519'
@@ -356,7 +419,14 @@ async function verifyMessage(rawMessage, { keyLookup = null, resolver = dns, max
         : crypto.verify(spec.hash, signingInput, publicKey, sigBytes);
 
       entry.result = ok ? 'pass' : 'fail';
-      if (!ok) entry.reason = 'imza uyuşmuyor';
+      entry.testMode = String(keyRecord.t || '').split(':').includes('y');
+      if (!ok) {
+        // Gövde özeti tuttu ama imza tutmadı: değişen şey BAŞLIKLARDA.
+        // Bu ayrım önemli, çünkü ikisinin sebepleri farklı — gövdeyi bir
+        // tarayıcı bozar, başlığı aradaki bir liste sunucusu yeniden yazar.
+        entry.reason = `imza uyuşmuyor — gövde özeti doğru, imzalanan başlıklardan biri değişmiş `
+          + `(h=${hNames.join(':')})`;
+      }
     } catch (err) {
       entry.result = err.dkimResult || 'permerror';
       entry.reason = err.message;
@@ -370,7 +440,12 @@ async function verifyMessage(rawMessage, { keyLookup = null, resolver = dns, max
     : results.some((r) => r.result === 'temperror') ? 'temperror'
       : results.some((r) => r.result === 'fail') ? 'fail' : 'permerror';
 
-  return { results, overall };
+  const failing = results.find((r) => r.result !== 'pass');
+  return {
+    results,
+    overall,
+    reason: overall === 'pass' ? null : (failing ? failing.reason : null),
+  };
 }
 
 function failPerm(msg) { const e = new Error(msg); e.dkimResult = 'permerror'; return e; }
