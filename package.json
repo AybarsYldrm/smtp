@@ -1,0 +1,44 @@
+{
+  "name": "@fitfak/mail",
+  "version": "2.0.0",
+  "description": "Fitfak posta sunucusu — SMTP (25/465/587), DKIM, S/MIME, webmail, gerçek zamanlı bildirim; @fitfak/database üzerinde şifreli saklama.",
+  "license": "MIT",
+  "main": "src/app.js",
+  "engines": {
+    "node": ">=20"
+  },
+  "bin": {
+    "fitfak-mail": "bin/fitfak-mail.js",
+    "fitfak-mail-cert": "bin/fitfak-mail-cert.js"
+  },
+  "scripts": {
+    "start": "node bin/fitfak-mail.js",
+    "check": "node bin/fitfak-mail.js --check",
+    "link:deps": "node scripts/link-deps.js",
+    "test": "node test/run-all.js",
+    "test:crypto": "node test/run-all.js crypto",
+    "test:mail": "node test/run-all.js mime smtp-e2e",
+    "test:db": "node test/run-all.js storage",
+    "test:http": "node test/run-all.js http-api auth-identity"
+  },
+  "peerDependencies": {
+    "@fitfak/database": "*",
+    "@fitfak/ssl": "*"
+  },
+  "peerDependenciesMeta": {
+    "@fitfak/database": {
+      "optional": false
+    },
+    "@fitfak/ssl": {
+      "optional": false
+    }
+  },
+  "dependencies": {},
+  "files": [
+    "bin",
+    "src",
+    "public",
+    "deploy",
+    "README.md"
+  ]
+}

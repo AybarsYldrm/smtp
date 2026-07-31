@@ -1,0 +1,16 @@
+{
+  "name": "Fitfak Posta",
+  "short_name": "Posta",
+  "description": "Fitfak posta kutusu",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#12142b",
+  "theme_color": "#12142b",
+  "lang": "tr",
+  "dir": "ltr",
+  "icons": [
+    { "src": "/static/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any maskable" },
+    { "src": "/static/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable" }
+  ]
+}

@@ -1,0 +1,52 @@
+# cloudflared — iki vhost, iki loopback adresi
+#
+#   /etc/cloudflared/config.yml
+#
+# Kurulum:
+#   cloudflared tunnel login
+#   cloudflared tunnel create fitfak-mail
+#   cloudflared tunnel route dns fitfak-mail aybars.net.tr
+#   cloudflared tunnel route dns fitfak-mail www.aybars.net.tr
+#   cloudflared tunnel route dns fitfak-mail mail.fitfak.net
+#   cloudflared tunnel route dns fitfak-mail webmail.fitfak.net
+#   sudo cloudflared service install
+#
+# ÖNEMLİ: SMTP (25/465/587) buradan GEÇMEZ. cloudflared yalnızca HTTP taşır;
+# posta trafiği doğrudan sunucunun genel IP'sine gelir. Bu yüzden
+# FITFAK_MAIL_PUBLIC_IP gerçek giden IP olmalı — SPF ve PTR onun üstüne kurulu.
+
+tunnel: fitfak-mail
+credentials-file: /etc/cloudflared/fitfak-mail.json
+
+# Tünelin kendi ölçümleri (yalnızca yerel).
+metrics: 127.0.0.1:20241
+no-autoupdate: true
+
+# Kaynağa bağlanırken beklenen süreler. Büyük ek yüklemeleri 30 sn'lik
+# öntanımlı bir zaman aşımına takılabilir.
+originRequest:
+  connectTimeout: 10s
+  keepAliveTimeout: 90s
+  noTLSVerify: false
+  # Ek yükleme/indirme için akışın kesilmemesi gerekiyor.
+  disableChunkedEncoding: false
+
+ingress:
+  # ── kişisel site ────────────────────────────────────────────────────────
+  - hostname: aybars.net.tr
+    service: http://127.0.1.1:80
+  - hostname: www.aybars.net.tr
+    service: http://127.0.1.1:80
+
+  # ── webmail + API ───────────────────────────────────────────────────────
+  - hostname: mail.fitfak.net
+    service: http://127.0.1.2:80
+    originRequest:
+      # Ekler 64 MiB'a kadar çıkabiliyor; yükleme sırasında bağlantının
+      # boşta sayılıp kapanmaması için.
+      keepAliveTimeout: 300s
+  - hostname: webmail.fitfak.net
+    service: http://127.0.1.2:80
+
+  # Eşleşmeyen her isim: kaynağa hiç gitmez.
+  - service: http_status:404
