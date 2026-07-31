@@ -20,24 +20,25 @@ const state = {
   query: '',
   messages: [],
   selected: null,
+  current: null,
   cursor: null,
   lastSeq: 0,
   socket: null,
   reconnectAttempt: 0,
   attachments: [],
   loading: false,
+  sourceOpen: false,
 };
 
 const el = (id) => document.getElementById(id);
-const $ = (sel, root = document) => root.querySelector(sel);
 
 const FOLDERS = [
-  { key: 'inbox', label: 'Gelen kutusu', icon: '📥' },
-  { key: 'sent', label: 'Gönderilenler', icon: '📤' },
-  { key: 'drafts', label: 'Taslaklar', icon: '📝' },
-  { key: 'archive', label: 'Arşiv', icon: '🗄' },
-  { key: 'spam', label: 'İstenmeyen', icon: '⚠' },
-  { key: 'trash', label: 'Çöp kutusu', icon: '🗑' },
+  { key: 'inbox', label: 'Gelen kutusu' },
+  { key: 'sent', label: 'Gönderilenler' },
+  { key: 'drafts', label: 'Taslaklar' },
+  { key: 'archive', label: 'Arşiv' },
+  { key: 'spam', label: 'İstenmeyen' },
+  { key: 'trash', label: 'Çöp kutusu' },
 ];
 
 /* ── API ─────────────────────────────────────────────────────── */
@@ -52,15 +53,17 @@ async function api(path, options = {}) {
     options.body = JSON.stringify(options.json);
   }
   const res = await fetch(path, { ...options, headers, credentials: 'same-origin' });
-  if (res.status === 401) { showLogin(); throw new Error('Oturum gerekli'); }
+  if (res.status === 401) { showScreen('login-screen'); throw new Error('Oturum gerekli'); }
 
   const contentType = res.headers.get('content-type') || '';
   const data = contentType.includes('json') ? await res.json() : await res.text();
   if (!res.ok) {
-    const message = (data && data.error) || `HTTP ${res.status}`;
-    const err = new Error(message);
+    const err = new Error((data && data.error) || `HTTP ${res.status}`);
     err.code = data && data.code;
     err.status = res.status;
+    // Sunucu "ne yapılmalı" bilgisini `detail` içinde veriyor (ör. eksik bir
+    // kapsam için yetkilendirme adresi). Arayüz onu gösterebilmeli.
+    err.detail = data && data.detail;
     throw err;
   }
   return data;
@@ -68,23 +71,34 @@ async function api(path, options = {}) {
 
 /* ── önyükleme ───────────────────────────────────────────────── */
 
+function showScreen(id) {
+  for (const screen of ['boot', 'login-screen', 'no-mailbox-screen', 'app']) {
+    el(screen).classList.toggle('hidden', screen !== id);
+  }
+}
+
 async function boot() {
   try {
     state.me = await api('/api/v1/me');
   } catch {
-    showLogin();
-    return;
-  }
-  if (!state.me.mailboxes.length) {
-    el('boot').innerHTML = `<div class="ff-card" style="text-align:center">
-      <h1>Posta kutusu yok</h1>
-      <p class="ff-muted">Bu kimliğe tanımlı bir posta kutusu bulunmuyor.</p>
-      <a class="ff-btn" href="/cikis">Çıkış yap</a></div>`;
+    showScreen('login-screen');
     return;
   }
 
-  el('boot').classList.add('ff-hidden');
-  el('app').hidden = false;
+  if (!state.me.mailboxes.length) {
+    // Kutu yok: bu bir hata değil, bir yetki durumu. Sunucu NEDENİNİ ve ne
+    // gerektiğini söylüyor; "boş gelen kutusu" göstermek yerine onu
+    // gösteriyoruz.
+    const reason = state.me.noMailbox || {};
+    el('no-mailbox-message').textContent = reason.message || 'Bu kimliğe tanımlı bir posta kutusu bulunmuyor.';
+    el('no-mailbox-action').textContent = reason.action || '';
+    el('no-mailbox-action').classList.toggle('hidden', !reason.action);
+    el('no-mailbox-email').textContent = state.me.email || '—';
+    showScreen('no-mailbox-screen');
+    return;
+  }
+
+  showScreen('app');
   el('account-email').textContent = state.me.email;
   el('brand-host').textContent = location.host;
 
@@ -97,18 +111,14 @@ async function boot() {
   registerServiceWorker();
 }
 
-function showLogin() {
-  el('boot').classList.add('ff-hidden');
-  el('app').hidden = true;
-  el('login-screen').classList.remove('ff-hidden');
-}
+el('no-mailbox-retry').addEventListener('click', () => { showScreen('boot'); boot(); });
 
 /* ── kenar çubuğu ────────────────────────────────────────────── */
 
 function renderMailboxPicker() {
   const select = el('mailbox-select');
   select.innerHTML = state.me.mailboxes
-    .map((m) => `<option value="${escapeAttr(m.ref)}">${escapeHtml(m.address)}</option>`).join('');
+    .map((m) => `<option value="${esc(m.ref)}">${esc(m.address)}</option>`).join('');
   select.value = state.mailbox.ref;
   renderAccessNote();
 }
@@ -130,21 +140,17 @@ function renderFolders() {
   const counts = (state.mailbox && state.mailbox.counts) || { byFolder: {} };
   el('folders').innerHTML = FOLDERS.map((f) => {
     const stat = counts.byFolder[f.key] || { total: 0, unread: 0 };
-    const badge = f.key === 'inbox' || f.key === 'spam'
-      ? (stat.unread ? `<span class="wm-folder-count">${stat.unread}</span>` : '')
-      : (stat.total ? `<span class="wm-folder-count">${stat.total}</span>` : '');
-    return `<button class="wm-folder${f.key === state.folder ? ' is-active' : ''}" data-folder="${f.key}">
-      <span class="wm-folder-icon">${f.icon}</span><span>${f.label}</span>${badge}
+    const n = (f.key === 'inbox' || f.key === 'spam') ? stat.unread : stat.total;
+    return `<button class="folder${f.key === state.folder ? ' is-active' : ''}" data-folder="${f.key}">
+      <span>${f.label}</span>${n ? `<span class="folder-count">${n}</span>` : ''}
     </button>`;
   }).join('');
 
-  for (const button of document.querySelectorAll('.wm-folder')) {
+  for (const button of document.querySelectorAll('.folder')) {
     button.addEventListener('click', () => {
       state.folder = button.dataset.folder;
-      state.selected = null;
+      clearSelection();
       renderFolders();
-      el('message-view').classList.add('ff-hidden');
-      el('read-placeholder').classList.remove('ff-hidden');
       loadMessages({ reset: true });
     });
   }
@@ -156,13 +162,12 @@ function renderQuota() {
   if (!m || !m.quotaBytes) { el('quota').textContent = ''; return; }
   const pct = Math.min(100, Math.round((m.usedBytes / m.quotaBytes) * 100));
   el('quota').innerHTML = `${formatBytes(m.usedBytes)} / ${formatBytes(m.quotaBytes)}
-    <div class="wm-quota-bar"><div class="wm-quota-fill${pct >= 90 ? ' is-full' : ''}" style="width:${pct}%"></div></div>`;
+    <div class="quota-bar"><div class="quota-fill${pct >= 90 ? ' is-full' : ''}" style="width:${pct}%"></div></div>`;
 }
 
 async function refreshCounts() {
   try {
-    const counts = await api(`/api/v1/mailboxes/${encodeURIComponent(state.mailbox.ref)}/counts`);
-    state.mailbox.counts = counts;
+    state.mailbox.counts = await api(`/api/v1/mailboxes/${encodeURIComponent(state.mailbox.ref)}/counts`);
     renderFolders();
   } catch { /* sayaçlar kritik değil */ }
 }
@@ -185,16 +190,15 @@ async function loadMessages({ reset = false } = {}) {
     const data = await api(`/api/v1/mailboxes/${encodeURIComponent(state.mailbox.ref)}/messages?${params}`);
     state.messages = reset ? data.messages : state.messages.concat(data.messages);
     state.cursor = data.nextCursor;
-    // Sıra numarası kaçırılan iletileri istemek için: en yükseğini tut.
     for (const message of data.messages) {
       if (message.seq > state.lastSeq) state.lastSeq = message.seq;
     }
     renderList();
     el('list-summary').textContent = `${state.messages.length} / ${data.total} ileti`;
-    el('load-more').classList.toggle('ff-hidden', !data.nextCursor);
+    el('load-more').classList.toggle('hidden', !data.nextCursor);
   } catch (err) {
     toast(err.message, 'error');
-    el('message-list').innerHTML = `<div class="ff-empty">Yüklenemedi: ${escapeHtml(err.message)}</div>`;
+    el('message-list').innerHTML = `<div class="empty">Yüklenemedi: ${esc(err.message)}</div>`;
   } finally {
     state.loading = false;
   }
@@ -202,109 +206,127 @@ async function loadMessages({ reset = false } = {}) {
 
 function renderList() {
   if (!state.messages.length) {
-    el('message-list').innerHTML = '<div class="ff-empty">Bu klasörde ileti yok.</div>';
+    el('message-list').innerHTML = '<div class="empty">Bu klasörde ileti yok.</div>';
     return;
   }
   el('message-list').innerHTML = state.messages.map((m) => {
     const marks = [];
-    if (m.hasAttachments) marks.push('<span class="ff-badge">📎 ' + m.attachmentCount + '</span>');
-    if (m.flagged) marks.push('<span class="ff-badge ff-badge-accent">★</span>');
-    if (m.smimeStatus === 'signed-valid') marks.push('<span class="ff-badge ff-badge-ok">🔏 imzalı</span>');
-    else if (m.smimeStatus && m.smimeStatus.startsWith('signed-')) marks.push('<span class="ff-badge ff-badge-warn">🔏 şüpheli</span>');
-    if (m.folder === 'spam') marks.push('<span class="ff-badge ff-badge-danger">spam</span>');
+    if (m.hasAttachments) marks.push(badge('neutral', `${m.attachmentCount} ek`));
+    if (m.flagged) marks.push(badge('info', 'işaretli'));
+    if (m.smimeStatus === 'signed-valid' || m.smimeStatus === 'signed-local') marks.push(badge('ok', 'imzalı'));
+    else if (m.smimeStatus && m.smimeStatus.startsWith('signed-')) marks.push(badge('bad', 'imza şüpheli'));
+    if (m.folder === 'spam') marks.push(badge('bad', 'istenmeyen'));
 
     const who = state.folder === 'sent'
-      ? (m.to && m.to.length ? m.to.map((t) => t.address).join(', ') : '—')
+      ? ((m.to && m.to.length) ? m.to.map((t) => t.address).join(', ') : '—')
       : (m.from.name || m.from.address || '(bilinmiyor)');
 
-    return `<div class="wm-item${m.seen ? '' : ' is-unread'}${state.selected === m.ref ? ' is-selected' : ''}"
-                 role="listitem" data-ref="${escapeAttr(m.ref)}" tabindex="0">
-      <div class="wm-item-top">
-        <span class="wm-item-from ff-truncate">${escapeHtml(who)}</span>
-        <span class="wm-item-date">${formatDate(m.receivedAt)}</span>
+    return `<button class="item${m.seen ? '' : ' is-unread'}${state.selected === m.ref ? ' is-selected' : ''}"
+                    role="listitem" data-ref="${esc(m.ref)}">
+      <div class="item-top">
+        <span class="item-from truncate">${esc(who)}</span>
+        <span class="item-date">${formatDate(m.receivedAt)}</span>
       </div>
-      <div class="wm-item-subject ff-truncate">${escapeHtml(m.subject || '(konu yok)')}</div>
-      <div class="wm-item-preview ff-truncate">${escapeHtml(m.preview || '')}</div>
-      ${marks.length ? `<div class="wm-item-marks">${marks.join('')}</div>` : ''}
-    </div>`;
+      <div class="item-subject truncate">${esc(m.subject || '(konu yok)')}</div>
+      <div class="item-preview truncate">${esc(m.preview || '')}</div>
+      ${marks.length ? `<div class="item-marks">${marks.join('')}</div>` : ''}
+    </button>`;
   }).join('');
 
-  for (const item of document.querySelectorAll('.wm-item')) {
-    const open = () => openMessage(item.dataset.ref);
-    item.addEventListener('click', open);
-    item.addEventListener('keydown', (e) => { if (e.key === 'Enter') open(); });
+  for (const item of document.querySelectorAll('.item')) {
+    item.addEventListener('click', () => openMessage(item.dataset.ref));
   }
 }
 
 function skeleton() {
-  return Array.from({ length: 6 }).map(() => `<div class="wm-item">
-    <div class="wm-item-top"><span class="wm-item-from ff-dim">yükleniyor…</span></div>
-    <div class="wm-item-subject ff-dim">&nbsp;</div></div>`).join('');
+  return Array.from({ length: 6 }).map(() => `<div class="item">
+    <div class="item-top"><span class="item-from dim">yükleniyor…</span></div>
+    <div class="item-subject dim">&nbsp;</div></div>`).join('');
+}
+
+function clearSelection() {
+  state.selected = null;
+  state.current = null;
+  state.sourceOpen = false;
+  el('message-view').classList.add('hidden');
+  el('read-placeholder').classList.remove('hidden');
+  el('app').classList.remove('is-reading');
 }
 
 /* ── ileti okuma ─────────────────────────────────────────────── */
 
 async function openMessage(ref) {
   state.selected = ref;
-  document.getElementById('app').classList.add('is-reading');
+  state.sourceOpen = false;
+  el('app').classList.add('is-reading');
   renderList();
-  el('read-placeholder').classList.add('ff-hidden');
-  el('message-view').classList.remove('ff-hidden');
-  el('message-view').innerHTML = '<div class="ff-empty"><span class="ff-spinner"></span></div>';
+  el('read-placeholder').classList.add('hidden');
+  el('message-view').classList.remove('hidden');
+  el('message-view').innerHTML = '<div class="empty"><span class="spinner"></span></div>';
 
   try {
     const message = await api(`/api/v1/messages/${encodeURIComponent(ref)}`);
+    state.current = message;
     renderMessage(message);
     const listed = state.messages.find((m) => m.ref === ref);
     if (listed && !listed.seen) { listed.seen = true; renderList(); refreshCounts(); }
   } catch (err) {
-    el('message-view').innerHTML = `<div class="ff-empty">Açılamadı: ${escapeHtml(err.message)}</div>`;
+    el('message-view').innerHTML = `<div class="empty">Açılamadı: ${esc(err.message)}</div>`;
   }
 }
 
 function renderMessage(message) {
   const auth = message.authResults || {};
   const badges = [];
-  if (auth.spf) badges.push(authBadge('SPF', auth.spf.result));
-  if (auth.dkim) badges.push(authBadge('DKIM', auth.dkim.overall));
-  if (auth.dmarc) badges.push(authBadge('DMARC', auth.dmarc.result));
+  if (auth.spf) badges.push(authBadge('SPF', auth.spf.result, auth.spf.explanation));
+  if (auth.dkim) badges.push(authBadge('DKIM', auth.dkim.overall, auth.dkim.reason));
+  if (auth.dmarc) badges.push(authBadge('DMARC', auth.dmarc.result, auth.dmarc.reason));
   if (message.smimeStatus && message.smimeStatus !== 'none') badges.push(smimeBadge(message));
+  if (message.spamScore) badges.push(badge(message.spamScore >= 5 ? 'bad' : 'warn', `spam puanı ${message.spamScore}`));
 
   const hasBlocked = /data-blocked-src=/.test(message.html || '');
   const body = message.html
-    ? `<div class="wm-msg-body" id="msg-html">${message.html}</div>`
-    : `<div class="wm-msg-body"><pre>${escapeHtml(message.text || '(boş ileti)')}</pre></div>`;
+    ? `<div class="msg-body" id="msg-html">${message.html}</div>`
+    : `<div class="msg-body"><pre>${esc(message.text || '(boş ileti)')}</pre></div>`;
+
+  const inSpam = message.folder === 'spam';
 
   el('message-view').innerHTML = `
-    <h1 class="wm-msg-subject">${escapeHtml(message.subject || '(konu yok)')}</h1>
-    <dl class="wm-msg-meta">
-      <div class="wm-msg-line"><dt>Gönderen</dt><dd>${escapeHtml(formatAddress(message.from))}</dd></div>
-      <div class="wm-msg-line"><dt>Alıcı</dt><dd>${escapeHtml((message.to || []).map(formatAddress).join(', ') || '—')}</dd></div>
-      ${message.cc && message.cc.length ? `<div class="wm-msg-line"><dt>Bilgi</dt><dd>${escapeHtml(message.cc.map(formatAddress).join(', '))}</dd></div>` : ''}
-      <div class="wm-msg-line"><dt>Tarih</dt><dd>${escapeHtml(new Date(message.receivedAt).toLocaleString('tr-TR'))}</dd></div>
-      ${badges.length ? `<div class="wm-auth-row">${badges.join('')}</div>` : ''}
-    </dl>
-
-    <div class="wm-msg-actions">
-      <button class="ff-btn ff-btn-sm" data-act="reply">↩ Yanıtla</button>
-      <button class="ff-btn ff-btn-sm" data-act="forward">↪ İlet</button>
-      <button class="ff-btn ff-btn-sm" data-act="flag">${message.flagged ? '★ İşareti kaldır' : '☆ İşaretle'}</button>
-      <button class="ff-btn ff-btn-sm" data-act="unread">◍ Okunmadı say</button>
-      <button class="ff-btn ff-btn-sm" data-act="archive">🗄 Arşivle</button>
-      <button class="ff-btn ff-btn-sm ff-btn-danger" data-act="delete">🗑 Sil</button>
-      <a class="ff-btn ff-btn-sm ff-btn-ghost" href="/api/v1/messages/${encodeURIComponent(message.ref)}/raw" target="_blank" rel="noopener">Kaynağı gör</a>
+    <div class="msg-actions">
+      <button class="btn btn-sm back-btn" data-act="back">← Liste</button>
+      <button class="btn btn-sm" data-act="reply">Yanıtla</button>
+      <button class="btn btn-sm" data-act="forward">İlet</button>
+      <button class="btn btn-sm" data-act="flag">${message.flagged ? 'İşareti kaldır' : 'İşaretle'}</button>
+      <button class="btn btn-sm" data-act="unread">Okunmadı say</button>
+      <button class="btn btn-sm" data-act="archive">Arşivle</button>
+      <button class="btn btn-sm" data-act="spam">${inSpam ? 'İstenmeyen değil' : 'İstenmeyen'}</button>
+      <button class="btn btn-sm" data-act="source">Kaynağı gör</button>
+      <button class="btn btn-sm btn-danger" data-act="delete">Sil</button>
     </div>
 
-    ${hasBlocked ? `<div class="wm-blocked-images ff-note ff-note-warn">
+    <h1 class="msg-subject">${esc(message.subject || '(konu yok)')}</h1>
+
+    <dl class="msg-meta">
+      <div class="msg-line"><dt>Gönderen</dt><dd>${esc(formatAddress(message.from))}</dd></div>
+      <div class="msg-line"><dt>Alıcı</dt><dd>${esc((message.to || []).map(formatAddress).join(', ') || '—')}</dd></div>
+      ${message.cc && message.cc.length ? `<div class="msg-line"><dt>Bilgi</dt><dd>${esc(message.cc.map(formatAddress).join(', '))}</dd></div>` : ''}
+      <div class="msg-line"><dt>Tarih</dt><dd>${esc(new Date(message.receivedAt).toLocaleString('tr-TR'))}</dd></div>
+      ${badges.length ? `<div class="auth-row">${badges.join('')}</div>` : ''}
+    </dl>
+
+    ${hasBlocked ? `<div class="blocked-images">
       <span>Uzak görseller engellendi — bunlar iletinin açıldığını gönderene bildirebilir.</span>
-      <button class="ff-btn ff-btn-sm" id="show-images">Görselleri göster</button>
+      <span class="spacer"></span>
+      <button class="btn btn-sm" id="show-images">Görselleri göster</button>
     </div>` : ''}
 
     ${body}
 
-    ${message.attachments && message.attachments.length ? `<div class="wm-attach-grid">
-      ${message.attachments.map(renderAttachment).join('')}
-    </div>` : ''}
+    ${message.attachments && message.attachments.length
+      ? `<div class="attach-grid">${message.attachments.map(renderAttachment).join('')}</div>`
+      : ''}
+
+    <div id="source-slot"></div>
   `;
 
   for (const button of el('message-view').querySelectorAll('[data-act]')) {
@@ -317,7 +339,7 @@ function renderMessage(message) {
         img.src = img.dataset.blockedSrc;
         img.removeAttribute('data-blocked-src');
       }
-      showImages.closest('.wm-blocked-images').remove();
+      showImages.closest('.blocked-images').remove();
     });
   }
   for (const preview of el('message-view').querySelectorAll('[data-preview]')) {
@@ -325,7 +347,7 @@ function renderMessage(message) {
       e.preventDefault();
       const img = document.createElement('img');
       img.src = preview.href;
-      img.className = 'wm-preview-img';
+      img.className = 'preview-img';
       preview.after(img);
       preview.remove();
     });
@@ -334,24 +356,74 @@ function renderMessage(message) {
 
 function renderAttachment(att) {
   if (att.scanStatus !== 'accepted') {
-    return `<div class="wm-attach is-rejected" title="${escapeAttr(att.rejectedReason || '')}">
-      <span class="wm-attach-icon">🚫</span>
-      <span class="wm-attach-info">
-        <span class="wm-attach-name">${escapeHtml(att.fileName)}</span>
-        <span class="wm-attach-size">teslim edilmedi — ${escapeHtml(att.rejectedReason || att.scanStatus)}</span>
+    return `<div class="attach is-rejected" title="${esc(att.rejectedReason || '')}">
+      <span class="attach-info">
+        <span class="attach-name">${esc(att.fileName)}</span>
+        <span class="attach-size">teslim edilmedi — ${esc(att.rejectedReason || att.scanStatus)}</span>
       </span></div>`;
   }
   const isImage = /^image\//.test(att.contentType) && !/svg/.test(att.contentType);
-  return `<a class="wm-attach" href="${escapeAttr(att.url)}" ${isImage ? 'data-preview="1"' : 'download'}>
-    <span class="wm-attach-icon">${iconFor(att.contentType)}</span>
-    <span class="wm-attach-info">
-      <span class="wm-attach-name">${escapeHtml(att.fileName)}</span>
-      <span class="wm-attach-size">${formatBytes(att.sizeBytes)}${isImage ? ' · önizle' : ''}</span>
+  return `<a class="attach" href="${esc(att.url)}" ${isImage ? 'data-preview="1"' : 'download'}>
+    <span class="attach-info">
+      <span class="attach-name">${esc(att.fileName)}</span>
+      <span class="attach-size">${formatBytes(att.sizeBytes)}${isImage ? ' · önizle' : ''}</span>
     </span></a>`;
 }
 
+/* ── ham kaynak ──────────────────────────────────────────────── */
+
+/**
+ * İletinin ham hâlini AYNI SAYFADA gösterir.
+ *
+ * Önceki sürümde "kaynağı gör" bir bağlantıydı ve sunucu `message/rfc822`
+ * döndürüyordu; tarayıcı bunu görüntülemiyor, indiriyordu. Bir imzanın neden
+ * geçmediğini anlamak için indirilen dosyayı bir metin düzenleyicide açmak
+ * gerekiyordu.
+ */
+async function toggleSource(message) {
+  const slot = el('source-slot');
+  if (state.sourceOpen) { slot.innerHTML = ''; state.sourceOpen = false; return; }
+
+  state.sourceOpen = true;
+  slot.innerHTML = '<div class="empty"><span class="spinner"></span></div>';
+  try {
+    const data = await api(`/api/v1/messages/${encodeURIComponent(message.ref)}/raw?format=json`);
+    const downloadUrl = `/api/v1/messages/${encodeURIComponent(message.ref)}/raw?format=eml`;
+    slot.innerHTML = `
+      <div class="source-panel">
+        <div class="source-head">
+          <span>Ham ileti</span>
+          <span class="tiny dim">${formatBytes(data.sizeBytes)}</span>
+          <span class="spacer"></span>
+          <a class="btn btn-sm" href="${esc(downloadUrl)}" download>.eml indir</a>
+          <button class="btn btn-sm" id="source-copy">Kopyala</button>
+        </div>
+        <pre class="source-body"><span class="hdr">${esc(data.headers)}</span>
+
+${esc(data.body)}</pre>
+      </div>`;
+    el('source-copy').addEventListener('click', async () => {
+      try { await navigator.clipboard.writeText(data.raw); toast('Kaynak panoya kopyalandı', 'ok'); }
+      catch { toast('Panoya kopyalanamadı', 'error'); }
+    });
+  } catch (err) {
+    slot.innerHTML = `<div class="note note-warn">${esc(
+      err.code === 'RAW_NOT_STORED'
+        ? 'Bu iletinin ham hâli saklanmamış.'
+        : `Kaynak alınamadı: ${err.message}`,
+    )}</div>`;
+  }
+}
+
+/* ── ileti eylemleri ─────────────────────────────────────────── */
+
 async function messageAction(action, message) {
   try {
+    if (action === 'back') { clearSelection(); return; }
+    if (action === 'source') { await toggleSource(message); return; }
+    if (action === 'reply') { openCompose({ reply: message }); return; }
+    if (action === 'forward') { openForward(message); return; }
+
     if (action === 'flag') {
       await api(`/api/v1/messages/${encodeURIComponent(message.ref)}/flags`, {
         method: 'POST', json: { flagged: !message.flagged },
@@ -380,18 +452,30 @@ async function messageAction(action, message) {
       toast('Arşivlendi', 'ok');
       return;
     }
+    if (action === 'spam') {
+      const markSpam = message.folder !== 'spam';
+      const result = await api(`/api/v1/messages/${encodeURIComponent(message.ref)}/spam`, {
+        method: 'POST', json: { spam: markSpam },
+      });
+      removeFromList(message.ref);
+      toast(
+        markSpam
+          ? `İstenmeyen olarak işaretlendi${result.verdictSaved ? ` — ${result.sender} artık doğrudan istenmeyene düşecek` : ''}`
+          : `İstenmeyen değil${result.verdictSaved ? ` — ${result.sender} artık gelen kutusuna düşecek` : ''}`,
+        'ok',
+      );
+      return;
+    }
     if (action === 'delete') {
       const permanent = state.folder === 'trash';
-      if (permanent && !confirm('Bu ileti kalıcı olarak silinecek. Emin misiniz?')) return;
+      if (permanent && !await confirmDialog('Kalıcı olarak sil',
+        'Bu ileti kalıcı olarak silinecek ve geri alınamayacak.')) return;
       await api(`/api/v1/messages/${encodeURIComponent(message.ref)}${permanent ? '?permanent=1' : ''}`, {
         method: 'DELETE',
       });
       removeFromList(message.ref);
       toast(permanent ? 'Kalıcı olarak silindi' : 'Çöp kutusuna taşındı', 'ok');
-      return;
     }
-    if (action === 'reply') { openCompose({ reply: message }); return; }
-    if (action === 'forward') { openForward(message); }
   } catch (err) {
     toast(err.message, 'error');
   }
@@ -399,11 +483,8 @@ async function messageAction(action, message) {
 
 function removeFromList(ref) {
   state.messages = state.messages.filter((m) => m.ref !== ref);
-  state.selected = null;
+  clearSelection();
   renderList();
-  el('message-view').classList.add('ff-hidden');
-  el('read-placeholder').classList.remove('ff-hidden');
-  document.getElementById('app').classList.remove('is-reading');
   refreshCounts();
 }
 
@@ -412,22 +493,20 @@ function removeFromList(ref) {
 function openCompose({ reply = null } = {}) {
   state.attachments = [];
   renderAttachChips();
-  el('compose-error').classList.add('ff-hidden');
+  el('compose-error').classList.add('hidden');
   el('compose-status').textContent = '';
 
   const fromSelect = el('c-from');
-  fromSelect.innerHTML = state.me.mailboxes
-    .filter((m) => ['owner', 'delegate', 'sender'].includes(m.role))
-    .map((m) => `<option value="${escapeAttr(m.address)}">${escapeHtml(m.address)}</option>`).join('');
-  if (!fromSelect.options.length) {
-    toast('Bu kimlikle gönderim yetkiniz yok', 'error');
-    return;
-  }
-  fromSelect.value = state.mailbox.address;
+  const sendable = state.me.mailboxes.filter((m) => ['owner', 'delegate', 'sender'].includes(m.role));
+  if (!sendable.length) { toast('Bu kimlikle gönderim yetkiniz yok', 'error'); return; }
+  fromSelect.innerHTML = sendable
+    .map((m) => `<option value="${esc(m.address)}">${esc(m.address)}</option>`).join('');
+  fromSelect.value = sendable.some((m) => m.address === state.mailbox.address)
+    ? state.mailbox.address : sendable[0].address;
 
   if (reply) {
     el('c-to').value = reply.replyTo || reply.from.address;
-    el('c-subject').value = /^re:/i.test(reply.subject) ? reply.subject : `Re: ${reply.subject}`;
+    el('c-subject').value = /^re:/i.test(reply.subject || '') ? reply.subject : `Re: ${reply.subject || ''}`;
     const quoted = (reply.text || '').split('\n').map((l) => `> ${l}`).join('\n');
     el('c-text').value = `\n\n${new Date(reply.receivedAt).toLocaleString('tr-TR')} tarihinde `
       + `${reply.from.address} yazdı:\n${quoted}`;
@@ -441,11 +520,12 @@ function openCompose({ reply = null } = {}) {
   const smimeAvailable = state.mailbox.smime && state.mailbox.smime.available;
   el('c-smime').disabled = !smimeAvailable;
   el('c-smime').checked = false;
-  el('c-smime').closest('label').title = smimeAvailable
+  el('smime-label').title = smimeAvailable
     ? 'İletiyi S/MIME sertifikanızla imzalar'
-    : 'Bu adres için S/MIME sertifikası yok';
+    : 'Bu adres için S/MIME sertifikası yok — Ayarlar > Sertifika';
+  el('smime-label').classList.toggle('dim', !smimeAvailable);
 
-  el('compose-modal').classList.remove('ff-hidden');
+  openModal('compose-modal');
   el('c-to').focus();
 }
 
@@ -456,12 +536,11 @@ function renderAttachChips() {
     : '';
   el('attach-list').innerHTML = state.attachments.map((file, i) => {
     const tooBig = file.size > state.me.limits.maxAttachmentBytes;
-    return `<div class="wm-attach-chip${tooBig ? ' is-error' : ''}">
-      <span>${iconFor(file.type)}</span>
-      <span class="ff-truncate" style="flex:1">${escapeHtml(file.name)}</span>
-      <span class="ff-tiny ff-dim">${formatBytes(file.size)}</span>
-      ${tooBig ? '<span class="ff-tiny">çok büyük</span>' : ''}
-      <button type="button" class="ff-btn ff-btn-ghost ff-btn-sm" data-remove="${i}">✕</button>
+    return `<div class="attach-chip${tooBig ? ' is-error' : ''}">
+      <span class="truncate" style="flex:1">${esc(file.name)}</span>
+      <span class="tiny dim">${formatBytes(file.size)}</span>
+      ${tooBig ? '<span class="tiny">çok büyük</span>' : ''}
+      <button type="button" class="btn btn-ghost btn-sm" data-remove="${i}">✕</button>
     </div>`;
   }).join('');
 
@@ -476,8 +555,8 @@ function renderAttachChips() {
 async function sendCompose() {
   const button = el('compose-send');
   button.disabled = true;
-  el('compose-error').classList.add('ff-hidden');
-  el('compose-status').innerHTML = '<span class="ff-spinner"></span> gönderiliyor…';
+  el('compose-error').classList.add('hidden');
+  el('compose-status').innerHTML = '<span class="spinner"></span> gönderiliyor…';
 
   try {
     const form = new FormData();
@@ -500,16 +579,12 @@ async function sendCompose() {
       headers: { 'x-csrf-token': state.me.csrfToken },
     });
 
-    el('compose-modal').classList.add('ff-hidden');
-    toast(
-      `Gönderildi${result.smimeSigned ? ' · S/MIME imzalı' : ''}${result.dkimSigned ? ' · DKIM imzalı' : ''}`,
-      'ok',
-    );
+    closeModal('compose-modal');
+    toast(`Gönderildi${result.smimeSigned ? ' · S/MIME imzalı' : ''}${result.dkimSigned ? ' · DKIM imzalı' : ''}`, 'ok');
     state.attachments = [];
     if (state.folder === 'sent') loadMessages({ reset: true });
   } catch (err) {
-    el('compose-error').textContent = err.message;
-    el('compose-error').className = 'ff-note ff-note-danger';
+    showNote('compose-error', err.message, 'bad');
   } finally {
     button.disabled = false;
     el('compose-status').textContent = '';
@@ -524,9 +599,9 @@ function openForward(message) {
   forwardTarget = message;
   el('f-to').value = '';
   el('f-comment').value = '';
-  el('forward-error').classList.add('ff-hidden');
+  el('forward-error').classList.add('hidden');
   el('f-smime').disabled = !(state.mailbox.smime && state.mailbox.smime.available);
-  el('forward-modal').classList.remove('ff-hidden');
+  openModal('forward-modal');
   el('f-to').focus();
 }
 
@@ -537,113 +612,24 @@ async function sendForward() {
   try {
     const result = await api(`/api/v1/messages/${encodeURIComponent(forwardTarget.ref)}/forward`, {
       method: 'POST',
-      json: {
-        to: el('f-to').value,
-        comment: el('f-comment').value,
-        smime: el('f-smime').checked,
-      },
+      json: { to: el('f-to').value, comment: el('f-comment').value, smime: el('f-smime').checked },
     });
-    el('forward-modal').classList.add('ff-hidden');
+    closeModal('forward-modal');
     toast(result.hasOriginalRaw
       ? 'İletildi (özgün ileti ek olarak)'
       : 'İletildi (ham ileti yoktu, gövde yeniden kuruldu)', 'ok');
   } catch (err) {
-    el('forward-error').textContent = err.message;
-    el('forward-error').className = 'ff-note ff-note-danger';
+    showNote('forward-error', err.message, 'bad');
   } finally {
     button.disabled = false;
   }
 }
 
-/* ── sertifika device code akışı ─────────────────────────────── */
-
-let certPollTimer = null;
-
-function openCertDeviceModal() {
-  el('cert-device-modal').classList.remove('ff-hidden');
-  el('cert-step-init').classList.remove('ff-hidden');
-  el('cert-step-waiting').classList.add('ff-hidden');
-  el('cert-error-note').classList.add('ff-hidden');
-}
-
-function closeCertDeviceModal() {
-  el('cert-device-modal').classList.add('ff-hidden');
-  if (certPollTimer) {
-    clearInterval(certPollTimer);
-    certPollTimer = null;
-  }
-}
-
-async function startCertDeviceFlow() {
-  const startBtn = el('cert-start-btn');
-  startBtn.disabled = true;
-  startBtn.textContent = 'Başlatılıyor…';
-  
-  const mailboxRef = encodeURIComponent(state.mailbox.ref);
-
-  try {
-    const startData = await api(`/api/v1/mailboxes/${mailboxRef}/certificate/device-start`, {
-      method: 'POST',
-    });
-
-    el('cert-user-code').textContent = startData.userCode;
-    el('cert-verify-link').href = startData.verificationUriComplete || startData.verificationUri;
-    
-    el('cert-step-init').classList.add('ff-hidden');
-    el('cert-step-waiting').classList.remove('ff-hidden');
-
-    const intervalMs = (startData.interval || 5) * 1000;
-    const expiresAt = Date.now() + (startData.expiresIn || 600) * 1000;
-
-    certPollTimer = setInterval(async () => {
-      if (Date.now() > expiresAt) {
-        clearInterval(certPollTimer);
-        showCertError('Süre doldu, lütfen tekrar deneyin.');
-        return;
-      }
-
-      try {
-        await api(`/api/v1/mailboxes/${mailboxRef}/certificate/device-complete`, {
-          method: 'POST',
-          json: { deviceCode: startData.deviceCode },
-        });
-
-        clearInterval(certPollTimer);
-        closeCertDeviceModal();
-        toast('S/MIME sertifikanız başarıyla oluşturuldu!', 'ok');
-        
-        state.me = await api('/api/v1/me');
-        state.mailbox = state.me.mailboxes.find((m) => m.ref === state.mailbox.ref) || state.mailbox;
-        openSettings(); 
-      } catch (err) {
-        if (err.status !== 400 && err.status !== 429) {
-          console.error(err);
-        }
-      }
-    }, intervalMs);
-
-  } catch (err) {
-    showCertError(err.message);
-    startBtn.disabled = false;
-    startBtn.textContent = 'Onay Sürecini Başlat';
-  }
-}
-
-function showCertError(msg) {
-  const note = el('cert-error-note');
-  note.textContent = msg;
-  note.className = 'ff-note ff-note-danger';
-  el('cert-step-init').classList.remove('ff-hidden');
-  el('cert-step-waiting').classList.add('ff-hidden');
-  el('cert-start-btn').disabled = false;
-  el('cert-start-btn').textContent = 'Onay Sürecini Başlat';
-}
-
 /* ── ayarlar ─────────────────────────────────────────────────── */
 
 async function openSettings() {
-  el('settings-modal').classList.remove('ff-hidden');
-  el('settings-body').innerHTML = '<div class="ff-empty"><span class="ff-spinner"></span></div>';
+  openModal('settings-modal');
+  el('settings-body').innerHTML = '<div class="empty"><span class="spinner"></span></div>';
 
   const mailboxRef = encodeURIComponent(state.mailbox.ref);
   const [certificate, credentials] = await Promise.all([
@@ -656,61 +642,71 @@ async function openSettings() {
   el('settings-body').innerHTML = `
     <section>
       <h3>Bildirimler</h3>
-      <label class="ff-check"><input type="checkbox" id="s-notify-mail" ${prefs.mail !== false ? 'checked' : ''}> Yeni posta bildirimi</label>
-      <label class="ff-check"><input type="checkbox" id="s-notify-security" checked disabled> Güvenlik uyarıları (kapatılamaz)</label>
-      <div class="ff-row-wrap">
-        <button class="ff-btn ff-btn-sm" id="s-push-toggle">${pushState.subscribed ? 'Bu cihazda kapat' : 'Bu cihazda aç'}</button>
-        <button class="ff-btn ff-btn-sm" id="s-push-test" ${pushState.subscribed ? '' : 'disabled'}>Test bildirimi</button>
-        <span class="ff-tiny ff-dim">${pushState.reason || ''}</span>
+      <label class="check"><input type="checkbox" id="s-notify-mail" ${prefs.mail !== false ? 'checked' : ''}> Yeni posta bildirimi</label><br>
+      <label class="check" style="margin-top:6px"><input type="checkbox" checked disabled> Güvenlik uyarıları (kapatılamaz)</label>
+      <div class="btn-row" style="margin-top:12px">
+        <button class="btn btn-sm" id="s-push-toggle">${pushState.subscribed ? 'Bu cihazda kapat' : 'Bu cihazda aç'}</button>
+        <button class="btn btn-sm" id="s-push-test" ${pushState.subscribed ? '' : 'disabled'}>Test bildirimi</button>
       </div>
+      ${pushState.reason ? `<p class="hint">${esc(pushState.reason)}</p>` : ''}
     </section>
 
     <section>
       <h3>S/MIME sertifikası</h3>
-      ${certificate.available ? `
-        <dl class="wm-kv">
-          <dt>Konu</dt><dd>${escapeHtml(certificate.subject || '—')}</dd>
-          <dt>Veren</dt><dd>${escapeHtml(certificate.issuer || '—')}</dd>
-          <dt>Seri</dt><dd class="ff-mono">${escapeHtml(certificate.serialHex || '—')}</dd>
-          <dt>Geçerlilik</dt><dd>${new Date(certificate.notBefore).toLocaleDateString('tr-TR')} — ${new Date(certificate.notAfter).toLocaleDateString('tr-TR')}</dd>
-          <dt>Parmak izi</dt><dd class="ff-mono ff-tiny">${escapeHtml(certificate.fingerprint || '—')}</dd>
-        </dl>
-        <div class="ff-row-wrap">
-          <button class="ff-btn ff-btn-sm" id="s-cert-renew">Yenile</button>
-          <a class="ff-btn ff-btn-sm ff-btn-ghost" download="smime.crt"
-             href="data:application/x-pem-file;base64,${btoa(unescape(encodeURIComponent(certificate.certPem || '')))}">Sertifikayı indir</a>
-        </div>` : `
-        <p class="ff-muted ff-small">Bu adres için henüz sertifika yok.
-          Sertifika olmadan giden postayı S/MIME ile imzalayamazsınız.</p>
-        <button class="ff-btn ff-btn-sm ff-btn-primary" id="s-cert-issue">Sertifika iste</button>`}
+      <div id="cert-slot">${renderCertificate(certificate)}</div>
     </section>
 
     <section>
-      <h3>Posta istemcisi (Thunderbird, Apple Mail…)</h3>
-      <dl class="wm-kv">
-        <dt>Sunucu</dt><dd>${escapeHtml(location.hostname)}</dd>
+      <h3>Posta istemcisi</h3>
+      <dl class="kv">
+        <dt>Sunucu</dt><dd class="mono">${esc(location.hostname)}</dd>
         <dt>Gönderme</dt><dd>587 (STARTTLS) veya 465 (TLS)</dd>
-        <dt>Kullanıcı adı</dt><dd>${escapeHtml(state.mailbox.address)}</dd>
+        <dt>Kullanıcı adı</dt><dd class="mono">${esc(state.mailbox.address)}</dd>
       </dl>
-      ${credentials.credentials.length ? `<div class="ff-tiny ff-dim">
-        ${credentials.credentials.length} kayıtlı kimlik ·
-        son kullanım: ${credentials.credentials[0].lastUsedAt ? new Date(credentials.credentials[0].lastUsedAt).toLocaleString('tr-TR') : 'hiç'}
-      </div>` : ''}
-      <button class="ff-btn ff-btn-sm" id="s-new-password">Yeni parola üret</button>
+      ${credentials.credentials.length ? `<p class="hint">${credentials.credentials.length} kayıtlı kimlik ·
+        son kullanım: ${credentials.credentials[0].lastUsedAt ? new Date(credentials.credentials[0].lastUsedAt).toLocaleString('tr-TR') : 'hiç'}</p>` : ''}
+      <button class="btn btn-sm" id="s-new-password">Yeni parola üret</button>
       <div id="s-password-out"></div>
     </section>
 
     <section>
       <h3>Hesap</h3>
-      <dl class="wm-kv">
-        <dt>Kimlik</dt><dd>${escapeHtml(state.me.email)}</dd>
-        <dt>Erişim</dt><dd>${escapeHtml(el('mailbox-access').textContent)}</dd>
+      <dl class="kv">
+        <dt>Kimlik</dt><dd class="mono">${esc(state.me.email)}</dd>
+        <dt>Erişim</dt><dd>${esc(el('mailbox-access').textContent)}</dd>
         <dt>Kullanım</dt><dd>${formatBytes(state.mailbox.usedBytes)} / ${formatBytes(state.mailbox.quotaBytes)}</dd>
+        <dt>Kapsamlar</dt><dd class="mono tiny">${esc((state.me.scopes || []).join(' ') || '—')}</dd>
       </dl>
     </section>
   `;
 
   bindSettings();
+}
+
+function renderCertificate(certificate) {
+  if (certificate.available) {
+    return `
+      <dl class="kv">
+        <dt>Konu</dt><dd class="mono tiny">${esc(certificate.subject || '—')}</dd>
+        <dt>Veren</dt><dd class="mono tiny">${esc(certificate.issuer || '—')}</dd>
+        <dt>Seri</dt><dd class="mono tiny">${esc(certificate.serialHex || '—')}</dd>
+        <dt>Geçerlilik</dt><dd>${new Date(certificate.notBefore).toLocaleDateString('tr-TR')} — ${new Date(certificate.notAfter).toLocaleDateString('tr-TR')}</dd>
+        <dt>Parmak izi</dt><dd class="mono tiny">${esc(certificate.fingerprint || '—')}</dd>
+      </dl>
+      <div class="btn-row">
+        <button class="btn btn-sm" id="s-cert-renew">Yenile</button>
+        <a class="btn btn-sm" download="smime.crt"
+           href="data:application/x-pem-file;base64,${btoa(unescape(encodeURIComponent(certificate.certPem || '')))}">İndir</a>
+      </div>`;
+  }
+  return `
+    <p class="muted">Bu adres için henüz sertifika yok. Sertifika olmadan giden postayı
+      S/MIME ile imzalayamazsınız.</p>
+    <p class="hint">Sertifika, fitfak kimlik hesabınız adına verilir ve kimlik yönetim
+      panelinde görünür. Bunun için oturumunuzun sertifika izni taşıması gerekiyor;
+      taşımıyorsa bir onay ekranına yönlendirilirsiniz.</p>
+    <button class="btn btn-sm btn-primary" id="s-cert-issue">Sertifika iste</button>
+    <div id="cert-error"></div>`;
 }
 
 function bindSettings() {
@@ -719,41 +715,20 @@ function bindSettings() {
   const notifyMail = el('s-notify-mail');
   if (notifyMail) {
     notifyMail.addEventListener('change', async () => {
-      await api(`/api/v1/mailboxes/${mailboxRef}/settings`, {
-        method: 'POST',
-        json: { notifyPrefs: { ...state.mailbox.notifyPrefs, mail: notifyMail.checked } },
-      }).catch((err) => toast(err.message, 'error'));
-      state.mailbox.notifyPrefs = { ...state.mailbox.notifyPrefs, mail: notifyMail.checked };
-    });
-  }
-
-  // SADECE BIR KERE TANIMLANDI: Doğrudan cihaz kodu modalını açar
-  const certIssueBtn = el('s-cert-issue');
-  if (certIssueBtn) {
-    certIssueBtn.addEventListener('click', () => {
-      openCertDeviceModal();
-    });
-  }
-
-  const certRenewBtn = el('s-cert-renew');
-  if (certRenewBtn) {
-    certRenewBtn.addEventListener('click', async () => {
-      certRenewBtn.disabled = true;
-      certRenewBtn.textContent = 'yenileniyor…';
       try {
-        await api(`/api/v1/mailboxes/${mailboxRef}/certificate/issue`, {
-          method: 'POST', json: { force: true },
+        await api(`/api/v1/mailboxes/${mailboxRef}/settings`, {
+          method: 'POST',
+          json: { notifyPrefs: { ...state.mailbox.notifyPrefs, mail: notifyMail.checked } },
         });
-        toast('Sertifika yenilendi', 'ok');
-        state.me = await api('/api/v1/me');
-        state.mailbox = state.me.mailboxes.find((m) => m.ref === state.mailbox.ref) || state.mailbox;
-        openSettings();
-      } catch (err) {
-        toast(err.message, 'error');
-        certRenewBtn.disabled = false;
-        certRenewBtn.textContent = 'Yenile';
-      }
+        state.mailbox.notifyPrefs = { ...state.mailbox.notifyPrefs, mail: notifyMail.checked };
+      } catch (err) { toast(err.message, 'error'); }
     });
+  }
+
+  for (const id of ['s-cert-issue', 's-cert-renew']) {
+    const button = el(id);
+    if (!button) continue;
+    button.addEventListener('click', () => requestCertificate(button, id === 's-cert-renew'));
   }
 
   const pushToggle = el('s-push-toggle');
@@ -772,19 +747,72 @@ function bindSettings() {
   const newPassword = el('s-new-password');
   if (newPassword) {
     newPassword.addEventListener('click', async () => {
-      if (!confirm('Yeni bir parola üretilecek ve öncekiler geçersiz olacak. Devam?')) return;
+      if (!await confirmDialog('Yeni parola üret',
+        'Yeni bir parola üretilecek ve önceki parola geçersiz olacak. Bu adresi kullanan posta istemcilerini yeniden ayarlamanız gerekir.')) return;
       try {
         const result = await api(`/api/v1/mailboxes/${mailboxRef}/smtp-credentials`, {
           method: 'POST', json: { label: 'posta istemcisi' },
         });
-        el('s-password-out').innerHTML = `<div class="ff-note ff-note-warn" style="margin-top:8px">
-          <div><strong>Kullanıcı adı:</strong> <code>${escapeHtml(result.username)}</code></div>
-          <div><strong>Parola:</strong> <code>${escapeHtml(result.password)}</code></div>
-          <div class="ff-tiny" style="margin-top:6px">${escapeHtml(result.note)}</div>
-        </div>`;
+        el('s-password-out').innerHTML = `
+          <div class="reveal"><span class="label">kullanıcı adı</span>${esc(result.username)}</div>
+          <div class="reveal"><span class="label">parola</span>${esc(result.password)}</div>
+          <p class="hint">${esc(result.note)}</p>`;
       } catch (err) { toast(err.message, 'error'); }
     });
   }
+}
+
+/**
+ * Sertifika isteği.
+ *
+ * Sertifika, kullanıcının KENDİ fitfak kimlik jetonuyla isteniyor; sunucu
+ * kendi servis kimliğiyle sormuyor. Sunucunun kimliği bir kullanıcıyı
+ * temsil etmediği için kimlik sağlayıcı onu "kullanıcı bulunamadı" diye
+ * reddediyordu.
+ *
+ * Oturum `cert:issue` kapsamını taşımıyorsa sunucu 409 ve bir yetkilendirme
+ * adresi döndürüyor. Kullanıcıyı giriş ekranına atmak yerine yalnızca eksik
+ * olan izin isteniyor; dönüşte aynı oturum devam ediyor.
+ */
+async function requestCertificate(button, force) {
+  const original = button.textContent;
+  button.disabled = true;
+  button.innerHTML = '<span class="spinner"></span> isteniyor…';
+  const slot = el('cert-error');
+  if (slot) slot.innerHTML = '';
+
+  try {
+    await api(`/api/v1/mailboxes/${encodeURIComponent(state.mailbox.ref)}/certificate/issue`, {
+      method: 'POST', json: { force, returnTo: location.pathname },
+    });
+    toast('S/MIME sertifikası verildi', 'ok');
+    state.me = await api('/api/v1/me');
+    state.mailbox = state.me.mailboxes.find((m) => m.ref === state.mailbox.ref) || state.mailbox;
+    openSettings();
+    return;
+  } catch (err) {
+    const authorizeUrl = err.detail && err.detail.authorizeUrl;
+    if (authorizeUrl) {
+      renderCertNote(
+        `${err.message} Sertifika alabilmek için fitfak kimlik hesabınızdan bir kez izin vermeniz gerekiyor.`,
+        'info',
+        `<a class="btn btn-sm btn-primary" href="${esc(authorizeUrl)}">İzin ver ve dön</a>`,
+      );
+    } else {
+      renderCertNote(err.message, 'bad', err.detail && err.detail.hint
+        ? `<span class="tiny">${esc(err.detail.hint)}</span>` : '');
+    }
+  } finally {
+    button.disabled = false;
+    button.textContent = original;
+  }
+}
+
+function renderCertNote(message, kind, actionsHtml) {
+  const slot = el('cert-error');
+  if (!slot) { toast(message, kind === 'bad' ? 'error' : 'ok'); return; }
+  slot.innerHTML = `<div class="note note-${kind}">${esc(message)}
+    ${actionsHtml ? `<div class="note-actions">${actionsHtml}</div>` : ''}</div>`;
 }
 
 /* ── bildirim aboneliği ──────────────────────────────────────── */
@@ -798,8 +826,7 @@ async function pushSubscriptionState() {
   }
   try {
     const registration = await navigator.serviceWorker.ready;
-    const subscription = await registration.pushManager.getSubscription();
-    return { subscribed: !!subscription, reason: '' };
+    return { subscribed: !!(await registration.pushManager.getSubscription()), reason: '' };
   } catch {
     return { subscribed: false, reason: '' };
   }
@@ -826,11 +853,7 @@ async function togglePush() {
       });
       await api('/api/v1/push/subscribe', {
         method: 'POST',
-        json: {
-          subscription: subscription.toJSON(),
-          mailbox: state.mailbox.ref,
-          topics: ['mail', 'security'],
-        },
+        json: { subscription: subscription.toJSON(), mailbox: state.mailbox.ref, topics: ['mail', 'security'] },
       });
       toast('Bildirimler açıldı', 'ok');
     }
@@ -867,9 +890,7 @@ function connectRealtime() {
     state.reconnectAttempt = 0;
     setConnStatus('live', 'canlı');
     if (state.lastSeq) {
-      socket.send(JSON.stringify({
-        type: 'catchup', mailboxRef: state.mailbox.ref, sinceSeq: state.lastSeq,
-      }));
+      socket.send(JSON.stringify({ type: 'catchup', mailboxRef: state.mailbox.ref, sinceSeq: state.lastSeq }));
     }
   });
 
@@ -882,9 +903,7 @@ function connectRealtime() {
     } else if (payload.type === 'catchup') {
       for (const message of payload.messages || []) onIncoming(message, { silent: true });
       if (payload.lastSeq > state.lastSeq) state.lastSeq = payload.lastSeq;
-      if ((payload.messages || []).length) {
-        toast(`${payload.messages.length} yeni ileti alındı`, 'ok');
-      }
+      if ((payload.messages || []).length) toast(`${payload.messages.length} yeni ileti alındı`, 'ok');
     } else if (payload.type === 'update' && payload.mailboxRef === state.mailbox.ref) {
       refreshCounts();
     }
@@ -921,9 +940,48 @@ function onIncoming(message, { silent = false } = {}) {
 }
 
 function setConnStatus(kind, text) {
-  const node = el('conn-status');
-  node.className = `wm-conn is-${kind}`;
+  el('conn-status').className = `conn is-${kind}`;
   el('conn-text').textContent = text;
+}
+
+/* ── kip pencereleri ─────────────────────────────────────────── */
+
+function openModal(id) { el(id).classList.add('is-open'); }
+function closeModal(id) { el(id).classList.remove('is-open'); }
+function closeAllModals() {
+  for (const modal of document.querySelectorAll('.modal-backdrop')) modal.classList.remove('is-open');
+}
+
+/**
+ * `confirm()` yerine.
+ *
+ * Tarayıcının kendi penceresi sayfanın tasarımıyla ilgisiz görünüyor ve
+ * bazı tarayıcılarda tekrarlandığında bastırılıyor — yani "kalıcı olarak
+ * sil" onayı hiç sorulmadan geçebiliyor.
+ */
+function confirmDialog(title, message) {
+  return new Promise((resolve) => {
+    el('confirm-title').textContent = title;
+    el('confirm-body').innerHTML = `<p class="muted">${esc(message)}</p>`;
+    openModal('confirm-modal');
+
+    const finish = (value) => {
+      closeModal('confirm-modal');
+      el('confirm-ok').removeEventListener('click', onOk);
+      el('confirm-cancel').removeEventListener('click', onCancel);
+      resolve(value);
+    };
+    const onOk = () => finish(true);
+    const onCancel = () => finish(false);
+    el('confirm-ok').addEventListener('click', onOk);
+    el('confirm-cancel').addEventListener('click', onCancel);
+  });
+}
+
+function showNote(id, message, kind) {
+  const node = el(id);
+  node.textContent = message;
+  node.className = `note note-${kind}`;
 }
 
 /* ── olay bağlama ────────────────────────────────────────────── */
@@ -931,7 +989,7 @@ function setConnStatus(kind, text) {
 function bindEvents() {
   el('mailbox-select').addEventListener('change', async (e) => {
     state.mailbox = state.me.mailboxes.find((m) => m.ref === e.target.value);
-    state.selected = null;
+    clearSelection();
     state.lastSeq = 0;
     renderAccessNote();
     renderQuota();
@@ -942,35 +1000,33 @@ function bindEvents() {
   });
 
   el('compose-btn').addEventListener('click', () => openCompose());
-  el('compose-close').addEventListener('click', () => el('compose-modal').classList.add('ff-hidden'));
-  el('compose-cancel').addEventListener('click', () => el('compose-modal').classList.add('ff-hidden'));
+  el('compose-close').addEventListener('click', () => closeModal('compose-modal'));
+  el('compose-cancel').addEventListener('click', () => closeModal('compose-modal'));
   el('compose-send').addEventListener('click', (e) => { e.preventDefault(); sendCompose(); });
   el('compose-form').addEventListener('submit', (e) => { e.preventDefault(); sendCompose(); });
 
-  el('toggle-cc').addEventListener('click', () => el('cc-row').classList.toggle('ff-hidden'));
-  el('toggle-bcc').addEventListener('click', () => el('bcc-row').classList.toggle('ff-hidden'));
+  el('toggle-cc').addEventListener('click', () => el('cc-row').classList.toggle('hidden'));
+  el('toggle-bcc').addEventListener('click', () => el('bcc-row').classList.toggle('hidden'));
   el('c-files').addEventListener('change', (e) => {
     for (const file of e.target.files) state.attachments.push(file);
     e.target.value = '';
     renderAttachChips();
   });
 
-  el('forward-close').addEventListener('click', () => el('forward-modal').classList.add('ff-hidden'));
-  el('forward-cancel').addEventListener('click', () => el('forward-modal').classList.add('ff-hidden'));
+  el('forward-close').addEventListener('click', () => closeModal('forward-modal'));
+  el('forward-cancel').addEventListener('click', () => closeModal('forward-modal'));
   el('forward-send').addEventListener('click', sendForward);
 
   el('settings-btn').addEventListener('click', openSettings);
-  el('settings-close').addEventListener('click', () => el('settings-modal').classList.add('ff-hidden'));
+  el('settings-close').addEventListener('click', () => closeModal('settings-modal'));
 
-  // 🟢 Cihaz Kodu modalı butonları (Ayarlar her açıldığında tekrar tekrar eklenmesin diye buraya taşındı)
-  const certClose = el('cert-modal-close');
-  if (certClose) certClose.addEventListener('click', closeCertDeviceModal);
-  
-  const certCancel = el('cert-modal-cancel');
-  if (certCancel) certCancel.addEventListener('click', closeCertDeviceModal);
-  
-  const certStart = el('cert-start-btn');
-  if (certStart) certStart.addEventListener('click', startCertDeviceFlow);
+  for (const backdrop of document.querySelectorAll('.modal-backdrop')) {
+    backdrop.addEventListener('click', (e) => {
+      // Onay penceresi dışarı tıklamayla kapanmaz: "vazgeç" ile "onayla"
+      // arasındaki farkı kazayla vermek istemiyoruz.
+      if (e.target === backdrop && backdrop.id !== 'confirm-modal') backdrop.classList.remove('is-open');
+    });
+  }
 
   el('refresh-btn').addEventListener('click', () => { loadMessages({ reset: true }); refreshCounts(); });
   el('load-more').addEventListener('click', () => loadMessages());
@@ -995,56 +1051,56 @@ function bindEvents() {
     }, 320);
   });
 
-  for (const chip of document.querySelectorAll('.wm-chip')) {
+  for (const chip of document.querySelectorAll('.chip[data-filter]')) {
     chip.addEventListener('click', () => {
-      for (const other of document.querySelectorAll('.wm-chip')) other.classList.remove('is-active');
+      for (const other of document.querySelectorAll('.chip[data-filter]')) other.classList.remove('is-active');
       chip.classList.add('is-active');
       state.filter = chip.dataset.filter;
       loadMessages({ reset: true });
     });
   }
 
-  el('menu-btn').addEventListener('click', () => document.getElementById('app').classList.add('is-menu-open'));
-  el('sidebar-close').addEventListener('click', () => document.getElementById('app').classList.remove('is-menu-open'));
+  el('menu-btn').addEventListener('click', () => el('app').classList.toggle('is-menu-open'));
 
   document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape') {
-      for (const id of ['compose-modal', 'settings-modal', 'forward-modal', 'cert-device-modal']) {
-        const m = el(id);
-        if (m) m.classList.add('ff-hidden');
-      }
-      document.getElementById('app').classList.remove('is-menu-open', 'is-reading');
+      closeAllModals();
+      el('app').classList.remove('is-menu-open');
     }
-    const inField = /^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement.tagName);
-    if (inField) return;
+    if (/^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement.tagName)) return;
+    if (document.querySelector('.modal-backdrop.is-open')) return;
     if (e.key === 'c') { e.preventDefault(); openCompose(); }
     if (e.key === '/') { e.preventDefault(); el('search').focus(); }
     if (e.key === 'r') { e.preventDefault(); loadMessages({ reset: true }); }
+    if (e.key === 'u' && state.current) { e.preventDefault(); clearSelection(); }
   });
 }
 
 /* ── biçimlendirme ───────────────────────────────────────────── */
 
-function authBadge(label, result) {
-  const good = result === 'pass';
-  const bad = ['fail', 'permerror', 'softfail'].includes(result);
-  const cls = good ? 'ff-badge-ok' : (bad ? 'ff-badge-danger' : 'ff-badge-warn');
-  return `<span class="ff-badge ${cls}" title="${label}: ${result}">${label} ${result}</span>`;
+function badge(kind, text) { return `<span class="badge badge-${kind}">${esc(text)}</span>`; }
+
+function authBadge(label, result, reason) {
+  const kind = result === 'pass' ? 'ok'
+    : (['fail', 'permerror', 'softfail'].includes(result) ? 'bad' : 'warn');
+  const title = reason ? `${label}: ${result} — ${reason}` : `${label}: ${result}`;
+  return `<span class="badge badge-${kind}" title="${esc(title)}">${label} ${esc(result)}</span>`;
 }
 
 function smimeBadge(message) {
   const map = {
-    'signed-valid': ['ff-badge-ok', '🔏 imza geçerli'],
-    'signed-invalid': ['ff-badge-danger', '🔏 imza geçersiz'],
-    'signed-untrusted': ['ff-badge-warn', '🔏 imzalayan güvenilmiyor'],
-    'signed-address-mismatch': ['ff-badge-danger', '🔏 imza adresi uyuşmuyor'],
-    'signed-expired': ['ff-badge-warn', '🔏 sertifika süresi dolmuş'],
-    'signed-local': ['ff-badge-ok', '🔏 imzalandı'],
-    encrypted: ['ff-badge-accent', '🔒 şifreli'],
+    'signed-valid': ['ok', 'S/MIME geçerli'],
+    'signed-invalid': ['bad', 'S/MIME geçersiz'],
+    'signed-untrusted': ['warn', 'S/MIME imzalayan güvenilmiyor'],
+    'signed-address-mismatch': ['bad', 'S/MIME adres uyuşmuyor'],
+    'signed-expired': ['warn', 'S/MIME süresi dolmuş'],
+    'signed-local': ['ok', 'S/MIME imzalandı'],
+    encrypted: ['info', 'şifreli'],
   };
-  const [cls, label] = map[message.smimeStatus] || ['ff-badge', message.smimeStatus];
-  const signer = message.smimeSigner ? ` — ${message.smimeSigner.emails?.join(', ') || ''}` : '';
-  return `<span class="ff-badge ${cls}" title="${escapeAttr(label + signer)}">${label}</span>`;
+  const [kind, label] = map[message.smimeStatus] || ['neutral', message.smimeStatus];
+  const signer = message.smimeSigner && message.smimeSigner.emails
+    ? ` — ${message.smimeSigner.emails.join(', ')}` : '';
+  return `<span class="badge badge-${kind}" title="${esc(label + signer)}">${esc(label)}</span>`;
 }
 
 function formatAddress(a) {
@@ -1073,29 +1129,15 @@ function formatBytes(bytes) {
   return `${n} B`;
 }
 
-function iconFor(contentType) {
-  const t = String(contentType || '');
-  if (t.startsWith('image/')) return '🖼';
-  if (t.startsWith('video/')) return '🎬';
-  if (t.startsWith('audio/')) return '🎵';
-  if (t.includes('pdf')) return '📕';
-  if (t.includes('zip') || t.includes('gzip') || t.includes('rar')) return '🗜';
-  if (t.includes('word') || t.includes('document')) return '📄';
-  if (t.includes('sheet') || t.includes('excel')) return '📊';
-  if (t.includes('rfc822')) return '✉';
-  return '📎';
-}
-
-function escapeHtml(s) {
+function esc(s) {
   return String(s == null ? '' : s).replace(/[&<>"']/g, (c) => (
     { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
   ));
 }
-function escapeAttr(s) { return escapeHtml(s); }
 
 function toast(message, kind = '') {
   const node = document.createElement('div');
-  node.className = `wm-toast${kind ? ` is-${kind}` : ''}`;
+  node.className = `toast${kind ? ` is-${kind}` : ''}`;
   node.textContent = message;
   el('toasts').append(node);
   setTimeout(() => {

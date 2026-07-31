@@ -59,19 +59,20 @@ class HttpServers {
     router.use(securityHeaders({
       // Webmail kendi betiğini çalıştırır; harici kaynak yok. `img-src`
       // data: ve cid: içerir çünkü gömülü görseller böyle geliyor.
+      // Webmail'in TÜM varlıkları yerel. Önceki liste session.fitfak.net'e
+      // stil ve yazı tipi izni veriyordu; o bağımlılık kaldırıldığı için
+      // izin de kaldırıldı — bir kimlik sağlayıcının erişilebilirliği posta
+      // kutusunun görünümünü belirlememeli.
       csp: [
         "default-src 'self'",
-        
-        // Cloudflare analiz betiğine izin ver
-        "script-src 'self' https://static.cloudflareinsights.com",
-        
-        "style-src 'self' 'unsafe-inline' https://session.fitfak.net",
+        "script-src 'self'",
+        "style-src 'self' 'unsafe-inline'",
+        // İleti gövdesindeki gömülü görseller data:/blob: olarak geliyor;
+        // uzak görseller sunucuda zaten engelleniyor (bkz. sanitizeHtml).
         "img-src 'self' data: blob:",
-        "font-src 'self' https://session.fitfak.net data:",
-        
-        // Service Worker fetch() istekleri, WebSocket ve Cloudflare veri gönderimi için bağlantı izinleri
-        "connect-src 'self' https://session.fitfak.net wss://envelope.fitfak.net wss://mail.fitfak.net https://cloudflareinsights.com",
-        
+        "font-src 'self' data:",
+        // Gerçek zamanlı akış aynı kökene bağlanıyor.
+        "connect-src 'self' ws: wss:",
         "frame-ancestors 'none'",
         "base-uri 'none'",
         "form-action 'self'",

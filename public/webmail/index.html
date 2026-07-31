@@ -1,263 +1,238 @@
 <!doctype html>
-<html lang="tr" data-ff-theme="dark">
+<html lang="tr">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<meta name="color-scheme" content="dark light">
-<meta name="theme-color" content="#12142b">
+<meta name="color-scheme" content="light dark">
 <title>Fitfak Posta</title>
 <link rel="manifest" href="/manifest.webmanifest">
 <link rel="icon" href="/favicon.ico">
 <!--
-  Uzak stil önce, yerel yedek sonra: session.fitfak.net'teki fitfak-ui.css
-  erişilebilirse tasarım oradan gelir, erişilemezse arayüz yine çalışır.
-  İkisi de aynı değişken adlarını kullanıyor.
+  Tek stil dosyası, tamamı yerel. Önceki sürüm session.fitfak.net'ten uzak bir
+  stil çekiyordu: o adres erişilemediğinde posta kutusu biçimsiz açılıyor ve
+  her ziyaretçinin IP'si üçüncü bir tarafa gidiyordu.
 -->
-<link rel="stylesheet" href="https://session.fitfak.net/static/fitfak-ui.css">
-<link rel="stylesheet" href="/static/fitfak-ui.css">
 <link rel="stylesheet" href="/static/webmail.css">
 </head>
 <body>
 
-<div id="app" class="wm" hidden>
-
-  <!-- ── kenar çubuğu ─────────────────────────────────────── -->
-  <aside class="wm-sidebar" id="sidebar">
-    <div class="wm-brand">
-      <span class="wm-brand-mark">✉</span>
-      <div>
-        <div class="wm-brand-name">Fitfak Posta</div>
-        <div class="ff-tiny ff-dim" id="brand-host">mail.fitfak.net</div>
-      </div>
-      <button class="ff-btn ff-btn-ghost ff-btn-icon wm-sidebar-close" id="sidebar-close" aria-label="Menüyü kapat">✕</button>
-    </div>
-
-    <div class="wm-mailbox-picker">
-      <label class="ff-label" for="mailbox-select">Posta kutusu</label>
-      <select class="ff-select" id="mailbox-select"></select>
-      <div class="ff-tiny ff-dim" id="mailbox-access"></div>
-    </div>
-
-    <button class="ff-btn ff-btn-primary wm-compose-btn" id="compose-btn">
-      <span>✎</span> Yeni ileti
-    </button>
-
-    <nav class="wm-folders" id="folders" aria-label="Klasörler"></nav>
-
-    <div class="wm-sidebar-foot">
-      <div class="wm-quota" id="quota" title="Kullanılan alan"></div>
-      <div class="wm-account">
-        <div class="ff-truncate ff-small" id="account-email">—</div>
-        <div class="ff-row" style="gap:6px">
-          <button class="ff-btn ff-btn-ghost ff-btn-sm" id="settings-btn">Ayarlar</button>
-          <a class="ff-btn ff-btn-ghost ff-btn-sm" href="/cikis">Çıkış</a>
-        </div>
-      </div>
-      <div class="wm-conn" id="conn-status" title="Gerçek zamanlı bağlantı">
-        <span class="wm-conn-dot"></span><span id="conn-text">bağlanıyor…</span>
-      </div>
-    </div>
-  </aside>
-
-  <!-- ── ileti listesi ────────────────────────────────────── -->
-  <section class="wm-list-pane">
-    <header class="wm-list-head">
-      <button class="ff-btn ff-btn-ghost ff-btn-icon wm-menu-btn" id="menu-btn" aria-label="Menü">☰</button>
-      <div class="wm-search">
-        <input class="ff-input" id="search" type="search" placeholder="Ara: konu, gönderen, içerik" autocomplete="off">
-      </div>
-      <button class="ff-btn ff-btn-ghost ff-btn-icon" id="refresh-btn" title="Yenile" aria-label="Yenile">⟳</button>
-    </header>
-
-    <div class="wm-list-filters">
-      <button class="wm-chip is-active" data-filter="all">Tümü</button>
-      <button class="wm-chip" data-filter="unread">Okunmamış</button>
-      <button class="wm-chip" data-filter="flagged">İşaretli</button>
-      <button class="wm-chip" data-filter="attachments">Ekli</button>
-      <div class="ff-spacer"></div>
-      <button class="ff-btn ff-btn-ghost ff-btn-sm" id="read-all-btn">Tümünü okundu say</button>
-    </div>
-
-    <div class="wm-list ff-scroll" id="message-list" role="list"></div>
-    <div class="wm-list-foot">
-      <button class="ff-btn ff-btn-sm ff-hidden" id="load-more">Daha fazla yükle</button>
-      <span class="ff-tiny ff-dim" id="list-summary"></span>
-    </div>
-  </section>
-
-  <!-- ── okuma bölmesi ────────────────────────────────────── -->
-  <section class="wm-read-pane ff-scroll" id="read-pane">
-    <div class="wm-placeholder" id="read-placeholder">
-      <div class="wm-placeholder-mark">✉</div>
-      <p class="ff-muted">Okumak için bir ileti seçin.</p>
-    </div>
-    <article class="wm-message ff-hidden" id="message-view"></article>
-  </section>
-</div>
-
-<!-- ── yükleniyor ─────────────────────────────────────────── -->
-<div class="ff-center" id="boot">
-  <div class="ff-card" style="text-align:center">
-    <div class="ff-spinner" style="width:28px;height:28px;border-width:3px"></div>
-    <p class="ff-muted" style="margin-top:16px">Posta kutusu yükleniyor…</p>
+<!-- ── açılış ─────────────────────────────────────────────── -->
+<div class="center" id="boot">
+  <div class="card" style="text-align:center">
+    <span class="spinner"></span>
+    <p class="muted" style="margin-top:14px">Posta kutusu yükleniyor…</p>
   </div>
 </div>
 
-<!-- ── giriş gerekli ──────────────────────────────────────── -->
-<div class="ff-center ff-hidden" id="login-screen">
-  <div class="ff-card" style="text-align:center">
-    <div class="wm-brand-mark" style="margin:0 auto 18px;width:52px;height:52px;font-size:1.5rem">✉</div>
+<!-- ── giriş gerekli ───────────────────────────────────────── -->
+<div class="center hidden" id="login-screen">
+  <div class="card">
     <h1>Fitfak Posta</h1>
-    <p class="ff-muted">Posta kutunuza erişmek için Fitfak kimliğinizle giriş yapın.</p>
-    <a class="ff-btn ff-btn-primary" href="/giris" style="width:100%;margin-top:8px">Fitfak Kimlik ile giriş yap</a>
-    <p class="ff-tiny ff-dim" style="margin-top:18px">
-      Harici bir adresle (ör. Gmail) giriş yapıyorsanız, adresinizin bir posta
-      kutusuna bağlanmış olması gerekir.
+    <p>Posta kutunuza erişmek için fitfak kimliğinizle giriş yapın.</p>
+    <a class="btn btn-primary block" href="/giris">fitfak kimlik ile giriş yap</a>
+    <p class="tiny dim" style="margin:16px 0 0">
+      Kendi alan adımızdaki bir adresle giriş yaparsanız kutunuz ilk girişte
+      açılır. Harici bir adresle (ör. Gmail) giriş yaparsanız, o adresin bir
+      posta kutusuna bağlanmış olması gerekir.
     </p>
   </div>
 </div>
 
-<!-- ── S/MIME sertifika cihaz kodu modalı ─────────────────── -->
-<div class="wm-modal ff-hidden" id="cert-device-modal" role="dialog" aria-modal="true" aria-labelledby="cert-modal-title">
-  <div class="wm-modal-card wm-modal-sm">
-    <header class="wm-modal-head">
-      <h2 id="cert-modal-title">S/MIME Sertifikası Al</h2>
-      <button class="ff-btn ff-btn-ghost ff-btn-icon" id="cert-modal-close" aria-label="Kapat">✕</button>
-    </header>
-    
-    <div class="wm-compose" style="text-align: center; padding: 20px 0;">
-      <p class="ff-muted" style="margin-bottom: 16px;">
-        Sertifikanızı güvenle oluşturmak için tarayıcınızda onay vermeniz gerekiyor.
-      </p>
-      
-      <div id="cert-step-init">
-        <button class="ff-btn ff-btn-primary" id="cert-start-btn">Onay Sürecini Başlat</button>
-      </div>
-
-      <div id="cert-step-waiting" class="ff-hidden">
-        <p class="ff-small">Lütfen aşağıdaki kodu kullanarak tarayıcınızda onay verin:</p>
-        <div style="font-size: 2rem; font-weight: bold; letter-spacing: 2px; margin: 12px 0; color: var(--ff-accent, #4f46e5);" id="cert-user-code">----</div>
-        <p style="margin-bottom: 16px;">
-          <a class="ff-btn ff-btn-sm ff-btn-ghost" id="cert-verify-link" href="#" target="_blank" rel="noopener">Onay Sayfasını Aç ↗</a>
-        </p>
-        <div class="ff-row" style="justify-content: center; gap: 8px; align-items: center;">
-          <span class="ff-spinner"></span>
-          <span class="ff-tiny ff-dim">IDP onayı bekleniyor...</span>
-        </div>
-      </div>
-
-      <div class="ff-note ff-hidden" id="cert-error-note" style="margin-top: 16px;"></div>
+<!-- ── posta kutusu yok ────────────────────────────────────── -->
+<div class="center hidden" id="no-mailbox-screen">
+  <div class="card">
+    <h1>Posta kutusu yok</h1>
+    <p id="no-mailbox-message">—</p>
+    <div class="note note-info" id="no-mailbox-action"></div>
+    <div class="kv" style="margin-top:16px">
+      <dt>Giriş yapan</dt><dd id="no-mailbox-email" class="mono">—</dd>
     </div>
-
-    <footer class="wm-modal-foot">
-      <div class="ff-spacer"></div>
-      <button class="ff-btn" id="cert-modal-cancel">İptal</button>
-    </footer>
+    <div class="btn-row">
+      <a class="btn" href="/cikis">Çıkış yap</a>
+      <button class="btn btn-primary" id="no-mailbox-retry">Yeniden dene</button>
+    </div>
   </div>
 </div>
 
-<!-- ── oluşturma penceresi ────────────────────────────────── -->
-<div class="wm-modal ff-hidden" id="compose-modal" role="dialog" aria-modal="true" aria-labelledby="compose-title">
-  <div class="wm-modal-card">
-    <header class="wm-modal-head">
-      <h2 id="compose-title">Yeni ileti</h2>
-      <button class="ff-btn ff-btn-ghost ff-btn-icon" id="compose-close" aria-label="Kapat">✕</button>
+<!-- ── uygulama ────────────────────────────────────────────── -->
+<div class="app hidden" id="app">
+
+  <aside class="sidebar" id="sidebar">
+    <div class="brand">
+      fitfak <span>posta</span>
+      <span class="brand-host" id="brand-host"></span>
+    </div>
+
+    <div class="mailbox-picker">
+      <select id="mailbox-select" aria-label="Posta kutusu"></select>
+      <div class="mailbox-access" id="mailbox-access"></div>
+    </div>
+
+    <button class="compose-btn" id="compose-btn">Yeni ileti</button>
+
+    <div class="nav-group">
+      <div class="nav-label">Klasörler</div>
+      <nav id="folders" aria-label="Klasörler"></nav>
+    </div>
+
+    <div class="sidebar-foot">
+      <div class="quota" id="quota"></div>
+      <div class="account-email" id="account-email">—</div>
+      <div class="sidebar-actions">
+        <button id="settings-btn">Ayarlar</button>
+        <a href="/cikis">Çıkış</a>
+      </div>
+      <div class="conn" id="conn-status" title="Gerçek zamanlı bağlantı">
+        <span class="conn-dot"></span><span id="conn-text">bağlanıyor…</span>
+      </div>
+    </div>
+  </aside>
+
+  <section class="list-pane">
+    <header class="list-head">
+      <button class="btn btn-ghost btn-icon menu-btn" id="menu-btn" aria-label="Menü">☰</button>
+      <input type="search" id="search" placeholder="Ara: konu, gönderen, içerik" autocomplete="off">
+      <button class="btn btn-ghost btn-icon" id="refresh-btn" title="Yenile" aria-label="Yenile">⟳</button>
     </header>
 
-    <form id="compose-form" class="wm-compose ff-scroll">
-      <div class="wm-compose-row">
-        <label class="ff-label" for="c-from">Gönderen</label>
-        <select class="ff-select" id="c-from"></select>
+    <div class="filters">
+      <button class="chip is-active" data-filter="all">Tümü</button>
+      <button class="chip" data-filter="unread">Okunmamış</button>
+      <button class="chip" data-filter="flagged">İşaretli</button>
+      <button class="chip" data-filter="attachments">Ekli</button>
+    </div>
+
+    <div class="list" id="message-list" role="list"></div>
+
+    <div class="list-foot">
+      <button class="btn btn-sm hidden" id="load-more">Daha fazla</button>
+      <button class="btn btn-sm btn-ghost" id="read-all-btn">Tümünü okundu say</button>
+      <span class="spacer"></span>
+      <span class="tiny dim" id="list-summary"></span>
+    </div>
+  </section>
+
+  <section class="read-pane" id="read-pane">
+    <div class="placeholder" id="read-placeholder">
+      <div>Okumak için bir ileti seçin.</div>
+      <div class="tiny">c: yeni ileti · /: ara · r: yenile</div>
+    </div>
+    <article class="message hidden" id="message-view"></article>
+  </section>
+</div>
+
+<!-- ── oluşturma ───────────────────────────────────────────── -->
+<div class="modal-backdrop" id="compose-modal" role="dialog" aria-modal="true" aria-labelledby="compose-title">
+  <div class="modal">
+    <div class="modal-head">
+      <h2 id="compose-title">Yeni ileti</h2>
+      <span class="spacer"></span>
+      <button class="btn btn-ghost btn-icon" id="compose-close" aria-label="Kapat">✕</button>
+    </div>
+
+    <form class="modal-body" id="compose-form">
+      <label class="field" for="c-from">Gönderen</label>
+      <select id="c-from"></select>
+
+      <label class="field" for="c-to">Alıcı</label>
+      <input type="text" id="c-to" placeholder="ornek@alan.com, ikinci@alan.com" required>
+
+      <div class="hidden" id="cc-row">
+        <label class="field" for="c-cc">Bilgi (Cc)</label>
+        <input type="text" id="c-cc" placeholder="cc@alan.com">
       </div>
-      <div class="wm-compose-row">
-        <label class="ff-label" for="c-to">Alıcı</label>
-        <input class="ff-input" id="c-to" placeholder="ornek@alan.com, ikinci@alan.com" required>
-      </div>
-      <div class="wm-compose-row ff-hidden" id="cc-row">
-        <label class="ff-label" for="c-cc">Bilgi (Cc)</label>
-        <input class="ff-input" id="c-cc" placeholder="cc@alan.com">
-      </div>
-      <div class="wm-compose-row ff-hidden" id="bcc-row">
-        <label class="ff-label" for="c-bcc">Gizli (Bcc)</label>
-        <input class="ff-input" id="c-bcc" placeholder="bcc@alan.com">
-      </div>
-      <div class="wm-compose-row">
-        <label class="ff-label" for="c-subject">Konu</label>
-        <input class="ff-input" id="c-subject" placeholder="Konu">
+      <div class="hidden" id="bcc-row">
+        <label class="field" for="c-bcc">Gizli (Bcc)</label>
+        <input type="text" id="c-bcc" placeholder="bcc@alan.com">
       </div>
 
-      <div class="wm-compose-toolbar">
-        <button type="button" class="ff-btn ff-btn-ghost ff-btn-sm" id="toggle-cc">Cc</button>
-        <button type="button" class="ff-btn ff-btn-ghost ff-btn-sm" id="toggle-bcc">Bcc</button>
-        <label class="ff-btn ff-btn-ghost ff-btn-sm" style="cursor:pointer">
+      <label class="field" for="c-subject">Konu</label>
+      <input type="text" id="c-subject" placeholder="Konu">
+
+      <div class="compose-toolbar">
+        <button type="button" class="btn btn-sm" id="toggle-cc">Cc</button>
+        <button type="button" class="btn btn-sm" id="toggle-bcc">Bcc</button>
+        <label class="btn btn-sm" style="cursor:pointer">
           Ek ekle
           <input type="file" id="c-files" multiple hidden>
         </label>
-        <label class="ff-check ff-small" title="İletiyi S/MIME sertifikanızla imzalar">
+        <label class="check tiny" id="smime-label">
           <input type="checkbox" id="c-smime"> S/MIME ile imzala
         </label>
-        <div class="ff-spacer"></div>
-        <span class="ff-tiny ff-dim" id="attach-summary"></span>
+        <span class="spacer"></span>
+        <span class="tiny dim" id="attach-summary"></span>
       </div>
 
-      <div class="wm-attachments" id="attach-list"></div>
+      <div class="attach-chips" id="attach-list"></div>
 
-      <textarea class="ff-textarea" id="c-text" placeholder="İletiniz…" rows="12"></textarea>
+      <textarea class="body" id="c-text" placeholder="İletiniz…"></textarea>
 
-      <div class="ff-note ff-hidden" id="compose-error"></div>
+      <div class="note note-bad hidden" id="compose-error"></div>
     </form>
 
-    <footer class="wm-modal-foot">
-      <span class="ff-tiny ff-dim" id="compose-status"></span>
-      <div class="ff-spacer"></div>
-      <button class="ff-btn" id="compose-cancel">Vazgeç</button>
-      <button class="ff-btn ff-btn-primary" id="compose-send">Gönder</button>
-    </footer>
-  </div>
-</div>
-
-<!-- ── ayarlar penceresi ──────────────────────────────────── -->
-<div class="wm-modal ff-hidden" id="settings-modal" role="dialog" aria-modal="true" aria-labelledby="settings-title">
-  <div class="wm-modal-card">
-    <header class="wm-modal-head">
-      <h2 id="settings-title">Ayarlar</h2>
-      <button class="ff-btn ff-btn-ghost ff-btn-icon" id="settings-close" aria-label="Kapat">✕</button>
-    </header>
-    <div class="wm-settings ff-scroll" id="settings-body"></div>
-  </div>
-</div>
-
-<!-- ── iletme penceresi ───────────────────────────────────── -->
-<div class="wm-modal ff-hidden" id="forward-modal" role="dialog" aria-modal="true">
-  <div class="wm-modal-card wm-modal-sm">
-    <header class="wm-modal-head">
-      <h2>İletiyi ilet</h2>
-      <button class="ff-btn ff-btn-ghost ff-btn-icon" id="forward-close" aria-label="Kapat">✕</button>
-    </header>
-    <div class="wm-compose">
-      <div class="wm-compose-row">
-        <label class="ff-label" for="f-to">Alıcı</label>
-        <input class="ff-input" id="f-to" placeholder="alici@alan.com">
-      </div>
-      <div class="wm-compose-row">
-        <label class="ff-label" for="f-comment">Not (isteğe bağlı)</label>
-        <textarea class="ff-textarea" id="f-comment" rows="4" placeholder="Bilgine."></textarea>
-      </div>
-      <label class="ff-check ff-small"><input type="checkbox" id="f-smime"> S/MIME ile imzala</label>
-      <p class="ff-tiny ff-dim">
-        Özgün ileti ek olarak gönderilir; böylece varsa imzası korunur.
-      </p>
-      <div class="ff-note ff-hidden" id="forward-error"></div>
+    <div class="modal-foot">
+      <span class="tiny dim" id="compose-status"></span>
+      <span class="spacer"></span>
+      <button class="btn" id="compose-cancel">Vazgeç</button>
+      <button class="btn btn-primary" id="compose-send">Gönder</button>
     </div>
-    <footer class="wm-modal-foot">
-      <div class="ff-spacer"></div>
-      <button class="ff-btn" id="forward-cancel">Vazgeç</button>
-      <button class="ff-btn ff-btn-primary" id="forward-send">İlet</button>
-    </footer>
   </div>
 </div>
 
-<div class="wm-toasts" id="toasts" aria-live="polite"></div>
+<!-- ── iletme ──────────────────────────────────────────────── -->
+<div class="modal-backdrop" id="forward-modal" role="dialog" aria-modal="true">
+  <div class="modal modal-sm">
+    <div class="modal-head">
+      <h2>İletiyi ilet</h2>
+      <span class="spacer"></span>
+      <button class="btn btn-ghost btn-icon" id="forward-close" aria-label="Kapat">✕</button>
+    </div>
+    <div class="modal-body">
+      <label class="field" for="f-to">Alıcı</label>
+      <input type="text" id="f-to" placeholder="alici@alan.com">
+
+      <label class="field" for="f-comment">Not (isteğe bağlı)</label>
+      <textarea id="f-comment" placeholder="Bilgine."></textarea>
+
+      <label class="check" style="margin-top:14px"><input type="checkbox" id="f-smime"> S/MIME ile imzala</label>
+      <p class="hint">Özgün ileti ek olarak gönderilir; böylece varsa imzası korunur.</p>
+
+      <div class="note note-bad hidden" id="forward-error"></div>
+    </div>
+    <div class="modal-foot">
+      <span class="spacer"></span>
+      <button class="btn" id="forward-cancel">Vazgeç</button>
+      <button class="btn btn-primary" id="forward-send">İlet</button>
+    </div>
+  </div>
+</div>
+
+<!-- ── ayarlar ─────────────────────────────────────────────── -->
+<div class="modal-backdrop" id="settings-modal" role="dialog" aria-modal="true" aria-labelledby="settings-title">
+  <div class="modal">
+    <div class="modal-head">
+      <h2 id="settings-title">Ayarlar</h2>
+      <span class="spacer"></span>
+      <button class="btn btn-ghost btn-icon" id="settings-close" aria-label="Kapat">✕</button>
+    </div>
+    <div class="modal-body settings" id="settings-body"></div>
+  </div>
+</div>
+
+<!-- ── onay ────────────────────────────────────────────────── -->
+<div class="modal-backdrop" id="confirm-modal" role="dialog" aria-modal="true">
+  <div class="modal modal-sm">
+    <div class="modal-head"><h2 id="confirm-title">Onay</h2></div>
+    <div class="modal-body" id="confirm-body"></div>
+    <div class="modal-foot">
+      <span class="spacer"></span>
+      <button class="btn" id="confirm-cancel">Vazgeç</button>
+      <button class="btn btn-primary" id="confirm-ok">Devam</button>
+    </div>
+  </div>
+</div>
+
+<div class="toasts" id="toasts" aria-live="polite"></div>
 
 <script src="/static/app.js" type="module"></script>
 </body>
