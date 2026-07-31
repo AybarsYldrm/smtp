@@ -18,13 +18,31 @@ const os = require('node:os');
 const TRUE_SET = new Set(['1', 'true', 'yes', 'on', 'evet']);
 
 function loadFileConfig() {
+  // Kütüphane olarak kullanıldığında yapılandırma `defineConfig()` ile
+  // koddan gelir; dosya ve ortam yine geçerlidir ve ortam en üstte kalır
+  // (bir sırrı ortamdan geçici olarak değiştirebilmek şart).
+  const inMemory = require('./config-source').get() || {};
   const p = process.env.FITFAK_MAIL_CONFIG;
-  if (!p) return {};
+  if (!p) return inMemory;
   try {
-    return JSON.parse(fs.readFileSync(p, 'utf8'));
+    return deepMerge(JSON.parse(fs.readFileSync(p, 'utf8')), inMemory);
   } catch (err) {
     throw new Error(`[config] FITFAK_MAIL_CONFIG okunamadı (${p}): ${err.message}`);
   }
+}
+
+/** Sığ değil derin birleştirme: `{ db: { target } }` diğer db alanlarını silmemeli. */
+function deepMerge(base, patch) {
+  const out = { ...base };
+  for (const [key, value] of Object.entries(patch || {})) {
+    if (value && typeof value === 'object' && !Array.isArray(value)
+      && out[key] && typeof out[key] === 'object' && !Array.isArray(out[key])) {
+      out[key] = deepMerge(out[key], value);
+    } else if (value !== undefined) {
+      out[key] = value;
+    }
+  }
+  return out;
 }
 
 const FILE_CFG = loadFileConfig();

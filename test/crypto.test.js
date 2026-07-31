@@ -33,6 +33,69 @@ const SAMPLE = [
 
 /* ── DKIM ──────────────────────────────────────────────────── */
 
+/**
+ * Gerçek bir MIME iletisi: MIME-Version + Content-Type +
+ * Content-Transfer-Encoding başlıkları `h=` listesini 78 sütunun üstüne
+ * çıkarıyor ve imza başlığı KATLANMAK zorunda kalıyor.
+ *
+ * Bu ayrıntı bir kaza değil, testin sebebi: katlama uzun süre `h=`
+ * listesini bir başlık adının ORTASINDAN bölüyordu ve imza doğrulanamaz
+ * hâle geliyordu. Az başlıklı örnek iletiler bunu göstermiyordu — yani
+ * denemeler geçerken gerçek postalar başarısız oluyordu.
+ */
+const MIME_SAMPLE = [
+  'From: Fitfak <network@fitfak.net>',
+  'To: Alıcı <alici@example.com>',
+  'Cc: Bilgi <bilgi@example.com>',
+  'Subject: =?UTF-8?B?QmlyIGtvbnUgc2F0xLFyxLE=?=',
+  'Date: Mon, 01 Jan 2024 09:00:00 +0000',
+  'Message-ID: <mime-ornek@fitfak.net>',
+  'MIME-Version: 1.0',
+  'Content-Type: text/plain; charset=utf-8',
+  'Content-Transfer-Encoding: quoted-printable',
+  '',
+  'Merhaba.',
+  '',
+].join('\r\n');
+
+for (const algorithm of ['rsa', 'ed25519']) {
+  runner.test(`DKIM ${algorithm}: katlanan h= listesi imzayı bozmaz`, async () => {
+    const keys = dkim.generateKeyPair({ algorithm });
+    const signed = dkim.signMessage({
+      rawMessage: MIME_SAMPLE, domain: 'fitfak.net', selector: 'mail',
+      privateKeyPem: keys.privateKeyPem, algorithm: keys.algorithm,
+    });
+
+    // Katlama gerçekten oldu mu? Olmadıysa test hiçbir şey kanıtlamıyor.
+    const lines = signed.signatureHeader.split('\r\n');
+    assert(lines.length > 1, 'imza başlığı katlanmalı (yoksa bu test anlamsız)');
+    assert(lines.every((l) => l.length <= 78), `satırlar 78 sütunu aşmamalı: ${lines.map((l) => l.length).join(',')}`);
+
+    // Hiçbir başlık adı ikiye bölünmemiş olmalı.
+    const hTag = signed.signatureHeader.match(/h=([\s\S]*?);/)[1].replace(/\s+/g, '');
+    assert(hTag.split(':').includes('content-transfer-encoding'),
+      `başlık adı bölünmüş: ${JSON.stringify(hTag)}`);
+
+    const verdict = await dkim.verifyMessage(signed.rawMessage, {
+      keyLookup: async () => [dkim.dnsRecordFromPrivateKey(keys.privateKeyPem)],
+    });
+    assertEqual(verdict.overall, 'pass', `doğrulama: ${verdict.reason || ''}`);
+  });
+}
+
+runner.test('DKIM: h= listesi bir adın ortasından katlanmış imza yine okunur', async () => {
+  // Başka bir imzalayıcı aynı hatayı yapmış olabilir. Boşlukları atarak
+  // okumak, o imzaları kurtarıyor; başlık adları boşluk içeremediği için
+  // bu hoşgörünün bir maliyeti yok.
+  const keys = dkim.generateKeyPair({ algorithm: 'rsa' });
+  const signed = dkim.signMessage({
+    rawMessage: MIME_SAMPLE, domain: 'fitfak.net', selector: 'mail',
+    privateKeyPem: keys.privateKeyPem,
+  });
+  const parsed = dkim.parseTagList(signed.signatureHeader.slice('DKIM-Signature:'.length));
+  assert(!/\s/.test(parsed.h), `h= etiketi boşluk içermemeli: ${JSON.stringify(parsed.h)}`);
+});
+
 for (const algorithm of ['rsa', 'ed25519']) {
   runner.test(`DKIM ${algorithm}: imza üretilir ve doğrulanır`, async () => {
     const keys = dkim.generateKeyPair({ algorithm });

@@ -217,6 +217,7 @@ async function deliver({
   rawMessage, envelopeFrom, recipient, heloName,
   resolver = dns, logger = null, timeouts = {}, localAddress = null,
   requireTls = false, port = 25, mxOverride = null, dsnRequested = false,
+  auth = null, implicitTls = false,
 }) {
   const t = { ...DEFAULT_TIMEOUTS, ...timeouts };
   const { domain } = splitAddress(recipient);
@@ -234,7 +235,7 @@ async function deliver({
     try {
       const result = await deliverToHost({
         host: mx.host, port, rawMessage, envelopeFrom, recipient, heloName,
-        logger, timeouts: t, localAddress, requireTls, dsnRequested,
+        logger, timeouts: t, localAddress, requireTls, dsnRequested, auth, implicitTls,
       });
       attempt.result = 'sent';
       attempt.code = result.code;
@@ -262,13 +263,30 @@ async function deliver({
 }
 
 async function deliverToHost({
-  host, port, rawMessage, envelopeFrom, recipient, heloName,
-  logger, timeouts, localAddress, requireTls, dsnRequested,
+  host, port = 25, rawMessage, envelopeFrom, recipient, heloName,
+  logger = null, timeouts: timeoutsInput = {}, localAddress = null,
+  requireTls = false, dsnRequested = false,
+  auth = null, implicitTls = false,
 }) {
-  const socket = await connectSocket({ host, port, timeout: timeouts.connect, localAddress });
-  let conn = new SmtpClientConnection(socket, { timeouts, logger, label: host });
+  // Öntanımlılar BURADA birleşiyor. `deliver()` da birleştiriyor ama bu
+  // fonksiyon dışarıdan doğrudan çağrılabiliyor (aktarıcı kipi); eksik bir
+  // zaman aşımı, `setTimeout(undefined)` ile alakasız bir tür hatasına
+  // dönüşüyordu.
+  const timeouts = { ...DEFAULT_TIMEOUTS, ...timeoutsInput };
+  // 465 örtük TLS ister: el sıkışma bağlantının ilk baytıyla başlar,
+  // STARTTLS yoktur. Düz bağlanıp STARTTLS beklemek o portta hiçbir zaman
+  // yanıt alamamak demek.
+  const plainSocket = await connectSocket({ host, port, timeout: timeouts.connect, localAddress });
+  let socket = plainSocket;
   let tlsUsed = false;
   let tlsVerified = false;
+  if (implicitTls) {
+    const upgraded = await upgradeToTls({ socket: plainSocket, host, requireTls });
+    socket = upgraded.socket;
+    tlsUsed = true;
+    tlsVerified = upgraded.verified;
+  }
+  let conn = new SmtpClientConnection(socket, { timeouts, logger, label: host });
 
   const fail = (reply, stage) => {
     throw new DeliveryError(`${stage}: ${reply.code} ${reply.text}`.trim(), {
@@ -290,7 +308,7 @@ async function deliverToHost({
 
     let capabilities = parseCapabilities(ehlo.lines);
 
-    if (capabilities.has('STARTTLS')) {
+    if (!tlsUsed && capabilities.has('STARTTLS')) {
       const starttls = await conn.command('STARTTLS');
       if (starttls.ok) {
         const upgraded = await upgradeToTls({ socket, host, requireTls });
@@ -308,8 +326,38 @@ async function deliverToHost({
       } else if (requireTls) {
         fail(starttls, 'STARTTLS');
       }
-    } else if (requireTls) {
+    } else if (!tlsUsed && requireTls) {
       throw new DeliveryError(`${host} STARTTLS duyurmuyor ve TLS zorunlu`, { permanent: false, mx: host });
+    }
+
+    // Kimlik doğrulama yalnızca AKTARICIYA (submission) gönderirken var; MX
+    // teslimatında yoktur. Parola ŞİFRESİZ kanalda gönderilmez: seçenek
+    // "gönderme"dir, çünkü gönderilen şey bir parola ve kanal dinlenebilir.
+    if (auth && auth.username) {
+      if (!tlsUsed) {
+        throw new DeliveryError(
+          `${host}: kimlik doğrulama isteniyor ama kanal şifreli değil (STARTTLS yok)`,
+          { permanent: true, stage: 'AUTH', mx: host },
+        );
+      }
+      const mechanisms = String([...capabilities].find((cap) => cap.startsWith('AUTH')) || '').toUpperCase();
+      if (mechanisms.includes('PLAIN') || !mechanisms) {
+        const token = Buffer.from(`\0${auth.username}\0${auth.password}`, 'utf8').toString('base64');
+        const reply = await conn.command(`AUTH PLAIN ${token}`);
+        if (!reply.ok) fail(reply, 'AUTH PLAIN');
+      } else if (mechanisms.includes('LOGIN')) {
+        const start = await conn.command('AUTH LOGIN');
+        if (start.code !== 334) fail(start, 'AUTH LOGIN');
+        const user = await conn.command(Buffer.from(auth.username, 'utf8').toString('base64'));
+        if (user.code !== 334) fail(user, 'AUTH LOGIN (kullanıcı)');
+        const pass = await conn.command(Buffer.from(auth.password, 'utf8').toString('base64'));
+        if (!pass.ok) fail(pass, 'AUTH LOGIN (parola)');
+      } else {
+        throw new DeliveryError(
+          `${host} desteklenen bir kimlik doğrulama yöntemi duyurmuyor (${mechanisms})`,
+          { permanent: true, stage: 'AUTH', mx: host },
+        );
+      }
     }
 
     const mailParams = [];
@@ -404,4 +452,7 @@ function parseCapabilities(lines) {
   return set;
 }
 
-module.exports = { deliver, resolveMailExchangers, SmtpReply, DeliveryError, SmtpClientConnection };
+module.exports = {
+  deliver, deliverToHost, resolveMailExchangers,
+  SmtpReply, DeliveryError, SmtpClientConnection, DEFAULT_TIMEOUTS,
+};

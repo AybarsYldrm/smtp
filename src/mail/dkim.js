@@ -184,7 +184,18 @@ function signMessage({
     `bh=${bh}`,
     'b=',
   ];
-  const unsignedHeader = `DKIM-Signature: ${tags.join('; ')}`;
+  // İmza, başlığın TELE YAZILACAK (katlanmış) hâli üzerinden hesaplanır.
+  //
+  // Katlama, relaxed kanoniklikte bir BOŞLUK bırakıyor: `content-type:` ile
+  // `content-transfer-encoding` arasına satır sonu koyulduğunda doğrulayan
+  // taraf orada bir boşluk görür. Eğer imza katlanmamış hâl üzerinden
+  // hesaplanırsa, imzalanan dizge ile doğrulanan dizge o boşluk kadar
+  // farklı olur ve imza — gövde değişmemiş olmasına rağmen — tutmaz.
+  //
+  // `b=` değeri bu aşamada BOŞ; doğrulayan da onu boşaltarak aynı dizgeye
+  // ulaşıyor. `b=` son etiket olduğu için, dolu hâlinin katlanması
+  // kendinden ÖNCEKİ satırları değiştirmiyor.
+  const unsignedHeader = foldSignature(`DKIM-Signature: ${tags.join('; ')}`);
 
   // Aynı başlık birden fazla varsa ALTTAN başlayarak tüketilir (RFC 6376
   // §5.4.2): üstteki eklenmiş olabilir, alttaki özgün olandır.
@@ -232,17 +243,103 @@ function signMessage({
   };
 }
 
-/** İmza başlığını 78 sütuna katlar. b= değeri satırlara bölünebilir. */
+/**
+ * İmza başlığını 78 sütuna katlar.
+ *
+ * ── BİLDİRİLEN HATA: kendi imzalarımız doğrulanmıyordu ──────────────────
+ * Önceki hâli, sığmayan bir satırı KÖR bir şekilde her 70 karakterde bir
+ * bölüyordu (`l.replace(/(.{70})/g, …)`). Bu, uzun bir `h=` listesinin
+ * ortasına denk geldiğinde bir BAŞLIK ADINI ikiye bölüyordu:
+ *
+ *     h=…:content-type:content-t
+ *       ransfer-encoding:from
+ *
+ * Doğrulayan taraf bu listeyi okuduğunda `content-t...ransfer-encoding`
+ * diye bir başlık arıyor, bulamıyor, onu BOŞ sayıyor ve imza tutmuyor.
+ * Gövde özeti doğru olduğu için hata "gövde değişmiş" gibi de görünmüyordu.
+ *
+ * Sinsi tarafı şu: hata yalnızca `h=` listesi uzun olduğunda çıkıyor. Az
+ * başlıklı düz metin iletiler geçiyordu; MIME başlıkları eklendiği anda
+ * (mime-version + content-type + content-transfer-encoding) liste 78
+ * sütunu aşıyor ve İMZA BOZULUYOR. Yani gerçek postalar başarısız,
+ * denemeler başarılıydı.
+ *
+ * Doğrusu: katlama YALNIZCA güvenli noktalarda yapılır.
+ *   - etiketler arasında (`;` sonrası) — her zaman güvenli,
+ *   - `b=` ve `bh=` içinde — base64 içindeki FWS yok sayılır (§3.5),
+ *   - `h=` içinde YALNIZCA `:` sonrasında — ABNF ayırıcının iki yanında
+ *     FWS'e izin veriyor, ama adın ortasında vermiyor.
+ * Başka hiçbir yerde bölünmez; sığmayan bir etiket satırı taşar (bu,
+ * bozuk bir imzadan iyidir).
+ */
 function foldSignature(header, maxLen = 78) {
+  const colonIndex = header.indexOf(':');
+  const fieldName = header.slice(0, colonIndex + 1);
+  const value = header.slice(colonIndex + 1).trim();
+
+  const tags = value.split(';').map((s) => s.trim()).filter(Boolean);
   const lines = [];
-  let line = '';
-  for (const token of header.split(' ')) {
-    if (line && line.length + token.length + 1 > maxLen) { lines.push(line); line = ' ' + token; }
-    else line += (line ? ' ' : '') + token;
+  let line = fieldName;
+
+  const flush = () => { lines.push(line); line = ' '; };
+
+  for (let i = 0; i < tags.length; i++) {
+    const terminator = i < tags.length - 1 ? ';' : '';
+    const tag = tags[i] + terminator;
+
+    if (line.length + 1 + tag.length <= maxLen) { line += ` ${tag}`; continue; }
+    if (line.trim()) flush();
+    if (line.length + tag.length <= maxLen) { line += tag; continue; }
+
+    for (const piece of splitTagValue(tags[i], maxLen - 1)) {
+      if (line.trim() && line.length + piece.length > maxLen) flush();
+      line += piece;
+    }
+    line += terminator;
   }
-  if (line) lines.push(line);
-  // b= değeri tek başına uzunsa onu da böl.
-  return lines.map((l) => (l.length <= maxLen ? l : l.replace(/(.{70})/g, `$1${CRLF}  `))).join(CRLF);
+  if (line.trim()) lines.push(line);
+  return lines.join(CRLF);
+}
+
+/** Tek başına satıra sığmayan bir etiketi GÜVENLİ noktalardan böler. */
+function splitTagValue(tag, width) {
+  const eq = tag.indexOf('=');
+  if (eq <= 0) return [tag];
+  const key = tag.slice(0, eq);
+  const value = tag.slice(eq + 1);
+
+  if (key === 'b' || key === 'bh') {
+    const pieces = [];
+    let rest = value;
+    let prefix = `${key}=`;
+    while (rest.length) {
+      const room = Math.max(8, width - prefix.length);
+      pieces.push(prefix + rest.slice(0, room));
+      rest = rest.slice(room);
+      prefix = '';
+    }
+    return pieces;
+  }
+
+  if (key === 'h') {
+    // Adların ortasından ASLA bölünmez; yalnızca ayırıcıdan sonra.
+    const names = value.split(':');
+    const pieces = [];
+    let current = `${key}=`;
+    for (let i = 0; i < names.length; i++) {
+      const piece = names[i] + (i < names.length - 1 ? ':' : '');
+      if (current !== `${key}=` && current.length + piece.length > width) {
+        pieces.push(current);
+        current = '';
+      }
+      current += piece;
+    }
+    if (current) pieces.push(current);
+    return pieces;
+  }
+
+  // Başka etiketler (d=, s=, i=) bölünemez; sığmıyorsa taşarlar.
+  return [tag];
 }
 
 /* ── doğrulama ─────────────────────────────────────────────── */
@@ -253,10 +350,16 @@ function parseTagList(value) {
     const eq = part.indexOf('=');
     if (eq <= 0) continue;
     const key = part.slice(0, eq).trim();
-    // Etiket değerlerinden boşluk temizlenir; b= ve bh= base64 olduğu için
-    // içindeki katlama boşlukları tamamen atılmalı.
+    // b=, bh= ve h= içindeki boşluklar tamamen atılır.
+    //
+    // b/bh base64 olduğu için zaten şart (§3.5: FWS yok sayılır). h= ise
+    // ABNF'e göre yalnızca ayırıcıların iki yanında FWS taşıyabilir — ama
+    // bazı imzalayıcılar (bir dönem bu sunucu dâhil) listeyi bir adın
+    // ortasından katlıyor. Boşlukları burada atmak, o imzaları doğru
+    // okumamızı sağlıyor; başlık adları zaten boşluk içeremez, dolayısıyla
+    // bu hoşgörünün bir maliyeti yok.
     const val = part.slice(eq + 1).trim();
-    out[key] = /^(b|bh)$/.test(key) ? val.replace(/\s+/g, '') : val;
+    out[key] = /^(b|bh|h)$/.test(key) ? val.replace(/\s+/g, '') : val;
   }
   return out;
 }

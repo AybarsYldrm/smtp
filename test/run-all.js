@@ -16,6 +16,7 @@ const SUITES = [
   ['mime', 'MIME oluşturma/ayrıştırma ve ek politikası'],
   ['storage', 'veritabanı sürücüsü, depolar, kasa, kuyruk'],
   ['smtp-e2e', 'SMTP uçtan uca'],
+  ['client', 'SMTP istemcisi ve kütüphane yüzeyi'],
   ['auth-identity', 'IdP kimlik doğrulama ve kimlik bağları'],
   ['http-api', 'HTTP API, gerçek zamanlı, kişisel site'],
 ];
