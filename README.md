@@ -1,10 +1,26 @@
-# @fitfak/mail
+# @fitfak/smtp
 
-Fitfak posta sunucusu. SMTP alma/gönderme (25 / 465 / 587), DKIM, SPF, DMARC,
-S/MIME imzalama, webmail arayüzü, gerçek zamanlı bildirim ve durum API'si.
-Bütün kalıcı veri `@fitfak/database` üzerinde şifreli olarak durur; PKI işleri
-`@fitfak/ssl` ile yapılır; oturum yetkilendirmesi Fitfak IdP
+Posta sunucusu ve SMTP istemcisi. SMTP alma/gönderme (25 / 465 / 587), DKIM,
+SPF, DMARC, S/MIME imzalama, webmail arayüzü, gerçek zamanlı bildirim ve durum
+API'si. Bütün kalıcı veri `@fitfak/database` üzerinde şifreli olarak durur; PKI
+işleri `@fitfak/ssl` ile yapılır; oturum yetkilendirmesi Fitfak IdP
 (`session.fitfak.net`) üzerinden yürür.
+
+Paket üç ayrı biçimde kullanılabiliyor ve hiçbiri diğerini gerektirmiyor:
+
+```js
+// 1) Tam sunucu
+const { defineConfig, startServer } = require('@fitfak/smtp');
+await startServer(defineConfig({ domain: 'ornek.com', /* … */ }));
+
+// 2) Yalnızca istemci — veritabanı, kasa, yapılandırma gerekmez
+const { SmtpClient } = require('@fitfak/smtp');
+await new SmtpClient({ host: 'mail.ornek.com', port: 587, auth })
+  .sendMail({ from: 'bilgi@ornek.com', to: ['ali@example.com'], subject: 'Merhaba', text: '…' });
+
+// 3) Parçalar
+const { dkim, spf, dmarc, parseMessage } = require('@fitfak/smtp');
+```
 
 ```
    ┌── cloudflared ──────────────────┐
@@ -74,6 +90,14 @@ node bin/fitfak-mail.js --no-smtp --no-dns --no-certs
 
 `bin/fitfak-mail.js` bayrakları: `--no-smtp`, `--no-http`, `--no-queue`,
 `--no-certs`, `--no-dns`, `--check`, `--help`.
+
+Komutlar:
+
+| Komut | İş |
+| --- | --- |
+| `fitfak-mail` | Sunucuyu başlatır |
+| `fitfak-mail-cert` | Sertifika alma/kaydetme/durum (`issue`, `register`, `bootstrap`, `status`) |
+| `fitfak-mail-verify` | Kaydedilmiş bir `.eml`'i SPF/DKIM/DMARC açısından yeniden değerlendirir |
 
 ### Gereksinimler
 
@@ -175,13 +199,102 @@ artık öntanımlı **salt okunur**; yazmak için `FITFAK_DNS_AUTO_APPLY=1` gere
 **9. Push bildirimleri bütün abonelere yayınlanıyordu.** Artık abonelik posta
 kutusuna bağlı ve yalnızca ilgili kutunun aboneleri uyarılıyor.
 
+**10. DKIM imza başlığı katlanırken bir başlık ADI ikiye bölünüyordu**
+*(bildirilen hata)*
+
+Katlayıcı, sığmayan satırı kör bir şekilde her 70 karakterde bölüyordu. Uzun
+bir `h=` listesinde bu, bir başlık adının ortasına denk geliyordu:
+
+```
+h=…:content-type:content-t
+  ransfer-encoding:from
+```
+
+Doğrulayan taraf `content-t…ransfer-encoding` diye bir başlık arıyor,
+bulamıyor, onu boş sayıyor ve imza tutmuyor. Gövde özeti doğru olduğu için
+hata "gövde değişmiş" gibi de görünmüyordu.
+
+Sinsi tarafı: hata yalnızca `h=` listesi 78 sütunu aştığında çıkıyor. Az
+başlıklı düz metin iletiler geçiyordu; `MIME-Version` + `Content-Type` +
+`Content-Transfer-Encoding` eklenince — yani **her gerçek posta** — imza
+bozuluyordu. Denemeler geçerken üretim başarısızdı.
+
+Katlama artık yalnızca güvenli noktalarda: etiketler arasında, `b=`/`bh=`
+base64'ünün içinde ve `h=` ayırıcısından *sonra*. İmza da tele yazılacak
+katlanmış hâl üzerinden hesaplanıyor — aksi hâlde katlamanın bıraktığı boşluk
+kadar fark oluşuyordu.
+
+**11. Sertifika, sunucunun kendi kimliğiyle isteniyordu** *(bildirilen hata)*
+
+IdP sertifikanın sahibini yalnızca jetonun `sub` alanından belirliyor.
+`client_credentials` jetonunda `sub` bir kullanıcı değil istemcinin kendisi
+olduğu için istek her zaman "Kullanıcı bulunamadı" ile reddediliyordu.
+Ayrıntı: [S/MIME sertifikaları](#smime-sertifikaları).
+
+**12. Arayüzdeki giriş düğmesi hiçbir şey yapmıyordu.** Arayüz `/giris` ve
+`/cikis` adreslerine bağlanıyordu ama yalnızca `/login` ve `/logout`
+kayıtlıydı; istek tek sayfa yakalayıcısına düşüp aynı sayfayı geri veriyordu.
+
+**13. Yönlendirme, iletiyi gönderenine geri gönderebiliyordu.** Bir kutunun
+yönlendirme hedefi iletinin göndereniyse posta olduğu yere dönüyordu. Artık
+gönderen, `Reply-To` ve kutunun kendisi hedef listesinden çıkarılıyor; ayrıca
+`X-Fitfak-Forwarded` işareti, `Received` zinciri sınırı ve otomatik ileti
+(RFC 3834) denetimi var.
+
+**14. "Kaynağı gör" iletiyi indiriyordu.** Sunucu `message/rfc822`
+döndürdüğü için tarayıcı görüntülemiyordu. Ham ileti artık sayfada açılıyor;
+indirme ve panoya kopyalama ayrı düğmelerde.
+
 ---
 
 ## Yapılandırma
 
-Öncelik sırası: **ortam değişkeni → yapılandırma dosyası → öntanımlı**.
-Dosya yolu `FITFAK_MAIL_CONFIG` ile verilir (JSON). Üretimde eksik sır
-açılışta hata verir; sessizce öntanımlıya düşülmez.
+Öncelik sırası: **ortam değişkeni → `defineConfig()` → yapılandırma dosyası →
+öntanımlı**. Dosya yolu `FITFAK_MAIL_CONFIG` ile verilir (JSON). Üretimde eksik
+sır açılışta hata verir; sessizce öntanımlıya düşülmez.
+
+### `defineConfig()` — kısa yol
+
+Altmış küsur ayarın hepsinin makul bir öntanımlısı var. Gerçekten VERİLMESİ
+gereken şey kısa bir liste: alan adı, veritabanına nasıl bağlanılacağı, iki
+sır, kimlik sağlayıcı ve (DNS denetimi isteniyorsa) Cloudflare anahtarları.
+
+```js
+const { defineConfig, startServer } = require('@fitfak/smtp');
+
+const config = defineConfig({
+  domain: 'ornek.com',                     // zorunlu
+  publicIp: '203.0.113.10',                // SPF kaydı buradan üretilir
+  vaultSecret: process.env.VAULT_SECRET,   // ≥32 bayt
+
+  database: {
+    target: 'https://db.ornek.com:51572',
+    caFingerprint: process.env.DB_CA_FINGERPRINT,
+    rootSecret: process.env.DB_ROOT_SECRET,
+    enrolmentSecret: process.env.DB_ENROLMENT_SECRET,
+  },
+
+  identity: {                              // OAuth2 / OIDC
+    baseUrl: 'https://session.ornek.com',
+    clientId: process.env.OAUTH_CLIENT_ID,
+    clientSecret: process.env.OAUTH_CLIENT_SECRET,
+  },
+
+  cloudflare: { apiToken: process.env.CF_API_TOKEN, zoneId: process.env.CF_ZONE_ID },
+});
+
+await startServer(config);
+```
+
+Türetilenler: `hostname` → `mail.<domain>`, webmail kökeni →
+`https://posta.<domain>`. Listede olmayan her ayar için `advanced` var; orada
+`src/config.js`'in bildiği bütün yollar geçerli.
+
+Bilinmeyen bir anahtar **hata verir**. Yazım hatasını yok saymak, "ayarladım
+ama etkisi yok" durumunun en yaygın sebebi.
+
+`defineConfig` yapılandırmayı kaydedip `src/config.js`'i yeniden yükler; bu
+yüzden başka hiçbir modül yüklenmeden önce, uygulamanın en başında çağrılmalı.
 
 ### Zorunlu (yalnızca `NODE_ENV=production`)
 
@@ -315,10 +428,47 @@ Beyan edilen tür ile dosya adı çelişiyorsa dosya güvenilmez sayılır.
 | --- | --- |
 | `LOG_LEVEL` | üretimde `info`, geliştirmede `debug` |
 | `LOG_JSON` | üretimde `true` |
+| `LOG_COLOR` | geliştirmede `true` (JSON kipinde her zaman kapalı) |
 | `LOG_REDACT_ADDRESSES` | üretimde `true` |
+
+Seviyeler: `trace` · `debug` · `info` · `warn` · `error` · `silent`.
+
+`trace` protokol seviyesini açar — SMTP komutları, IdP ve sertifika sunucusu
+istek/yanıtları, DKIM imza girdisi. Bu seviyede bile **sırlar maskelenir**:
+`Authorization`, `client_secret`, `code`, `refresh_token`, `device_code` ve
+jeton alanları yalnızca ilk/son dört karakterle yazılır. "Doğru jetonu mu
+gönderdik" sorusu bununla cevaplanabiliyor, jeton ele geçirilemiyor.
 
 Adres maskeleme üretimde açık: kayıt dosyası, veritabanının şifrelediği veriyi
 düz metin sızdıran yer olmamalı.
+
+```
+16:04:12.883 INFO  [mail] gelen ileti saklandı from=ay***@gmail.com to=ne***@fitfak.net spf=pass dmarc=pass
+16:04:12.884 DEBUG [mail] gelen doğrulama ms=142.51 spf=pass dkim=pass dmarc=pass
+```
+
+### Bir doğrulama hatasını teşhis etmek
+
+`DKIM fail` tek başına eyleme dönüşmüyor. `debug` seviyesinde her başarısız
+imza, hangi adımda düştüğüyle birlikte yazılıyor: gövde özeti mi tutmadı
+(hesaplanan ve bildirilen değerle), DNS'te kayıt mı yok, yoksa özet doğruyken
+başlıklardan biri mi değişti.
+
+Kaydedilmiş bir iletiyi aynı kodla ama tam çıktıyla yeniden değerlendirmek
+için:
+
+```bash
+# Webmail'de: ileti > "Kaynağı gör" > ".eml indir"
+fitfak-mail-verify ileti.eml --ip 209.85.220.41 --mail-from ali@gmail.com
+```
+
+```
+DKIM   fail  1 imza
+       fail d=gmail.com s=20230601 a=rsa-sha256
+         gövde özeti uyuşmuyor (beklenen 8Kd0jH…, hesaplanan Lm3xQa…,
+         kanoniklik relaxed, 4211 bayt) — gövde aktarım sırasında değişmiş olabilir
+         dns=20230601._domainkey.gmail.com bulundu=evet
+```
 
 ---
 
@@ -454,7 +604,41 @@ Sertifikalar ana sertifika sağlayıcısından (`trust.fitfak.net`) alınır. Ke
 ASN.1/OID katmanımız **yok** — hepsi `@fitfak/ssl` üzerinden (`profiles.email`
 profili S/MIME'a karşılık gelir).
 
-İki yol var ve farkları önemli:
+### Sertifikanın sahibi jetondan belirlenir
+
+Bu, yanlış anlaşıldığında en çok zaman kaybettiren nokta. IdP'nin sertifika
+servisi, sertifikanın kime yazılacağını **yalnızca taşıyıcı jetonun `sub`
+alanından** okuyor; istek gövdesindeki `userId` alanına bakmıyor:
+
+```
+resolveCurrentSession(req) -> jeton doğrulanır -> userId = payload.sub
+certificateService.requestCertificate({ userId, … })
+  users.get(userId) -> yoksa: AppError('user_not_found', 'Kullanıcı bulunamadı')
+```
+
+`client_credentials` ile alınan bir jetonda `sub` bir kullanıcı **değil**,
+istemcinin kendisidir. Bu yüzden servis jetonuyla bir kullanıcı kutusu için
+sertifika istemek her zaman "Kullanıcı bulunamadı" ile biter — ve hata mesajı
+yanıltıcıdır: kullanıcı gerçekten yok değil, yanlış kimlikle sorulmuştur.
+
+Buradan çıkan üç kural:
+
+| Sertifika kimin? | Kullanılan jeton | Nasıl |
+| --- | --- | --- |
+| Bir kullanıcının kutusu | Kullanıcının kendi IdP erişim jetonu | Webmail → Ayarlar → Sertifika iste, ya da `fitfak-mail-cert issue` |
+| Sunucunun kendi kimliği | `client_credentials` | `FITFAK_TRUST_ALLOW_SERVICE_IDENTITY=1` + sistem kutusu |
+| Kullanıcının kendi cihazı | Cihaz kodu (RFC 8628) | `fitfak-mail-cert issue`, özel anahtar makinede kalır |
+
+Sertifika istemek `cert:issue` kapsamı gerektiriyor. Oturum bu kapsamı
+taşımıyorsa API `409 CERT_SCOPE_REQUIRED` ve bir yetkilendirme adresi
+döndürüyor; arayüz kullanıcıyı `/yetki-yukselt` üzerinden tek bir onay turuna
+gönderiyor ve dönüşte **aynı** oturum devam ediyor. Kullanıcı yeniden giriş
+yapmıyor.
+
+IdP tarafında ayrıca RBAC var: kullanıcının `certProfiles` alanında `smime`
+işaretli olmalı (fitfak kimlik yönetim paneli → Kullanıcılar → Sertifika
+yetkileri). Değilse dönen hata `profile_not_allowed` ve API bunu ne yapılması
+gerektiğini söyleyen bir `hint` ile birlikte iletir.
 
 ### Kullanıcı yolu — cihaz kodu (özel anahtar sunucuya hiç gelmez)
 
@@ -477,19 +661,26 @@ Kullanıcı kendi sertifikasını doğrulama için kaydettirmek isterse:
 fitfak-mail-cert register --address network@fitfak.net --cert ./smime.crt
 ```
 
-### Sunucu yolu — sistemdeki her kayıtlı adres için
+### Sunucu yolu — yalnızca sistem kutuları
 
-Sunucunun kutular adına sertifika isteyebilmesi için bir kez yenileme jetonu
-alınır ve kasaya yazılır:
+Arka plan taraması KULLANICI kutularına dokunmaz: onlar için gereken jeton
+yalnızca kullanıcı giriş yaptığında var. Tarama, sistem kutularını
+(`postmaster`, `dmarc`) kapsıyor ve bunun için sunucunun kendi kimliği
+gerekiyor:
 
 ```bash
+# Servis kimliğini aç (öntanımlı KAPALI)
+FITFAK_TRUST_ALLOW_SERVICE_IDENTITY=1
+
+# client_credentials desteklenmiyorsa: bir kez cihaz akışıyla yenileme jetonu
 FITFAK_MAIL_VAULT_SECRET=… fitfak-mail-cert bootstrap
 ```
 
-Bundan sonra `FITFAK_TRUST_AUTO_ISSUE=1` (öntanımlı) ile sertifika yöneticisi
-`FITFAK_TRUST_CHECK_MS` (6 saat) aralığıyla dolaşır: sertifikası olmayan her
-kayıtlı adres için sertifika ister, ömrünün `FITFAK_TRUST_RENEW_RATIO` (0.66)
-oranını geçmiş olanları yeniler. Durum:
+`FITFAK_TRUST_AUTO_ISSUE=1` ile sertifika yöneticisi `FITFAK_TRUST_CHECK_MS`
+(6 saat) aralığıyla dolaşır ve ömrünün `FITFAK_TRUST_RENEW_RATIO` (0.66)
+oranını geçmiş sertifikaları yeniler. Kullanıcı jetonuyla alınmış bir
+sertifika arka planda yenilenemez (jeton yok); süresi yaklaştığında kayda
+uyarı düşer ve sahibinin arayüzden yenilemesi gerekir. Durum:
 
 ```bash
 fitfak-mail-cert status
@@ -556,9 +747,10 @@ Beklenmeyen `Host` başlığı reddedilir.
 
 | | |
 | --- | --- |
-| `GET /giris?donus=…&eposta=…` | IdP'ye yönlendirir |
+| `GET /giris?donus=…&eposta=…` | IdP'ye yönlendirir (`/login` de aynı) |
 | `GET /oauth/callback` | Kod değişimi (`state` tek kullanımlık) |
 | `GET,POST /cikis?hepsi=1` | Çıkış (`hepsi=1` IdP oturumlarını da iptal eder) |
+| `GET /yetki-yukselt?kapsam=cert:issue&donus=…` | Eksik kapsam için tek turluk onay; oturum korunur |
 | `GET /api/v1/sessions` · `DELETE /api/v1/sessions/:ref` | Etkin oturumlar |
 
 ### Posta kutusu
@@ -570,10 +762,20 @@ Beklenmeyen `Host` başlığı reddedilir.
 | `GET /api/v1/mailboxes/:mailbox/counts` | Klasör sayaçları |
 | `GET /api/v1/mailboxes/:mailbox/since/:seq` | Kaçırılan iletiler (sıra numarasıyla) |
 | `GET /api/v1/messages/:ref` | İleti (`markRead=0` ile okundu işaretlemeden) |
-| `GET /api/v1/messages/:ref/raw` | Ham RFC 5322 kaynağı |
+| `GET /api/v1/messages/:ref/raw?format=text\|eml\|json` | Ham RFC 5322 kaynağı |
 | `GET /api/v1/messages/:ref/attachments/:attRef?t=…` | Ek indirme |
 | `POST /api/v1/messages/:ref/flags` · `/move` · `DELETE …` | Bayrak, taşıma, silme |
+| `POST /api/v1/messages/:ref/spam` | `{ "spam": true\|false }` — klasör + gönderen kararı |
 | `POST /api/v1/mailboxes/:mailbox/read-all` | Tümünü okundu işaretle |
+
+`raw` üç biçim veriyor ve üçü ayrı bir ihtiyaç: `text` tarayıcıda okunur
+(öntanımlı), `eml` indirir, `json` başlık/gövde ayrımını ve doğrulama izini
+verir. `message/rfc822` göndermek tarayıcıyı indirmeye zorluyordu; "kaynağı
+gör" bağlantısı bu yüzden hiçbir şey göstermiyordu.
+
+`spam` uç noktası `move`'dan ayrı, çünkü karar yalnızca bu iletiyi değil
+**göndereni** de ilgilendiriyor: verdiğiniz karar kutunun süzme kurallarına
+yazılıyor, böylece aynı işareti her hafta yeniden koymuyorsunuz.
 
 Ek bağlantıları **oturuma bağlı** kısa ömürlü jeton ister (`?t=`): jeton kasa
 sırrı ile oturum referansından türetilir, başka bir oturumda geçersizdir.
@@ -623,6 +825,26 @@ Hata kodları: `403 SENDER_NOT_ALLOWED`, `409 NO_SMIME_CERT`,
 | `GET /api/v1/status/dns?refresh=1` | DNS denetim sonucu |
 | `POST /api/v1/status/dns/apply` | Eksik kayıtları yaz (yönetici) |
 | `GET /api/v1/status/audit?action=&actor=&limit=` | Denetim kaydı |
+
+### Sertifika
+
+| | |
+| --- | --- |
+| `GET /api/v1/mailboxes/:mailbox/certificate` | Kayıtlı sertifika (özel anahtar DÖNMEZ) |
+| `POST /api/v1/mailboxes/:mailbox/certificate/issue` | Kullanıcının kendi kimliğiyle iste/yenile |
+| `POST /api/v1/mailboxes/:mailbox/certificate/register` | Kendi cihazında ürettiği sertifikayı kaydet |
+| `GET /api/v1/mailboxes/:mailbox/certificate/remote` | IdP'nin bu kullanıcı adına verdiği sertifikalar |
+
+`issue` hata kodları:
+
+| Kod | Anlamı ve çıkışı |
+| --- | --- |
+| `409 CERT_SCOPE_REQUIRED` | Oturum `cert:issue` taşımıyor. Yanıtın `detail.authorizeUrl` alanı onay adresini veriyor. |
+| `409 IDP_REAUTH_REQUIRED` | IdP jetonu yenilenemedi; yeniden giriş gerekiyor. |
+| `502 PROFILE_NOT_ALLOWED` | IdP bu hesaba bu profilde izin vermiyor (yönetim paneli → Sertifika yetkileri). |
+| `502 USER_NOT_FOUND` | Yanlış kimlikle sorulmuş — bkz. [S/MIME sertifikaları](#smime-sertifikaları). |
+| `502 KEY_ALREADY_CERTIFIED` | Bu açık anahtar için zaten sertifika var; `force: true` ile yeni anahtar üretin. |
+| `503 SSL_MISSING` | `@fitfak/ssl` yüklü değil, CSR hazırlanamıyor. |
 
 ### Yönetici
 
@@ -801,17 +1023,18 @@ kayıtlarında açık bırakmayın.
 ## Testler
 
 ```bash
-npm test                 # altı paket, 141 denetim
+npm test                 # yedi paket, 143 denetim
 node test/run-all.js crypto storage      # seçili paketler
 node test/crypto.test.js                 # tek paket, ayrıntılı çıktı
 ```
 
 | Paket | Kapsam | Denetim |
 | --- | --- | --- |
-| `crypto` | DKIM imzala/doğrula, SPF, DMARC, S/MIME CMS | 36 |
+| `crypto` | DKIM imzala/doğrula (katlama dâhil), SPF, DMARC, S/MIME CMS | 31 |
 | `mime` | MIME oluşturma/ayrıştırma, ek politikası, kodlamalar | 24 |
 | `storage` | Veritabanı sürücüsü, depolar, kasa, kuyruk | 31 |
 | `smtp-e2e` | 25/465/587 uçtan uca, DKIM'in üç yolda da uygulanması | 13 |
+| `client` | SMTP istemcisi (aktarıcı, AUTH, DKIM), `defineConfig` | 7 |
 | `auth-identity` | IdP oturumu, kimlik bağları, yönetici kısıtı | 12 |
 | `http-api` | HTTP API, CSRF, ek jetonları, gerçek zamanlı, site | 25 |
 

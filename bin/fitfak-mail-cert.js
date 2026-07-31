@@ -131,19 +131,28 @@ async function commandIssue(args) {
   } catch { /* userinfo yoksa devam */ }
 
   print('Sertifika isteği gönderiliyor…');
+  const log = require('../src/util/log');
+  // Kayıt seviyesi burada AÇIKÇA ayarlanıyor: bu bir komut satırı aracı ve
+  // çıktısı kullanıcıya gösterilen metin. `--verbose` ile protokol izi
+  // açılabiliyor, çünkü bir sertifika reddedildiğinde sorulan ilk soru
+  // "IdP tam olarak ne dedi" oluyor.
+  log.configure({ level: args.verbose ? 'trace' : 'warn' });
+
   const { CertificateManager } = require('../src/certs/manager');
-  const manager = new CertificateManager({
-    config,
-    logger: { info: () => {}, warn: () => {}, error: () => {}, debug: () => {} },
-    stores: null,
-  });
+  const manager = new CertificateManager({ config, stores: null });
   const issued = await manager.requestCertificate({
     csrPem: request.csrPem,
     profile: args.profile || config.trust.smimeProfile,
     accessToken: tokens.accessToken,
+    // Cihaz akışıyla alınan jeton KULLANICIYA ait: sertifika IdP'de o
+    // kullanıcıya yazılır. Servis kimliği burada geçerli değil.
+    identity: 'user',
     path: config.trust.devicePath,
     extra: { subjectAddress: address },
-  }).catch((err) => fail(err.message));
+  }).catch((err) => {
+    if (err.hint) { print(''); print(`ipucu: ${err.hint}`); }
+    return fail(err.message);
+  });
 
   const outDir = path.resolve(args.out || path.join(process.cwd(), 'certs', address.replace(/[^a-z0-9]+/gi, '_')));
   await fsp.mkdir(outDir, { recursive: true, mode: 0o700 });
