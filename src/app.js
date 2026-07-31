@@ -29,7 +29,12 @@ class MailApplication {
   async start({ withSmtp = true, withHttp = true, withQueue = true, withCerts = true, withDns = true } = {}) {
     const config = this.config;
     config.validate();
-    log.configure({ level: config.log.level, json: config.log.json, redactAddresses: config.log.redactAddresses });
+    log.configure({
+      level: config.log.level,
+      json: config.log.json,
+      color: config.log.color,
+      redactAddresses: config.log.redactAddresses,
+    });
 
     this.logger.info({
       env: config.env,

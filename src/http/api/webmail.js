@@ -117,6 +117,16 @@ function registerWebmailRoutes(router, deps) {
       isAdmin: !!session.isAdmin,
       csrfToken: session.csrfToken,
       mailboxes,
+      // Kutu yoksa arayüz "boş gelen kutusu" göstermek yerine NEDENİNİ ve ne
+      // yapılması gerektiğini gösterebilsin. Gmail gibi harici bir adresle
+      // giren kullanıcı için bu, tek anlamlı ekran.
+      noMailbox: mailboxes.length ? null : sessions.describeNoMailbox({
+        email: session.idpEmail,
+        sub: session.idpSub,
+        emailVerified: true,
+      }),
+      scopes: String(session.scope || '').split(/\s+/).filter(Boolean),
+      certIssueScope: config.trust.issueScope,
       limits: {
         maxAttachmentBytes: config.limits.maxAttachmentBytes,
         maxTotalAttachmentBytes: config.limits.maxTotalAttachmentBytes,
@@ -563,95 +573,116 @@ function registerWebmailRoutes(router, deps) {
     });
   });
 
-  // 1. Adım: Cihaz kodu akışını başlat
-  router.post('/api/v1/mailboxes/:mailbox/certificate/device-start', async (ctx) => {
-    const session = await requireSession(ctx);
-    requireCsrf(ctx, session);
-    const { mailbox } = await resolveMailbox(ctx, session, ctx.params.mailbox, 'owner');
-    
-    // IdpClient kullanarak cihaz kodu isteği atıyoruz
-    const { IdpClient } = require('../../auth/idp-client');
-    const idp = new IdpClient({
-      baseUrl: config.idp.baseUrl,
-      clientId: config.idp.deviceClientId || config.idp.clientId,
-      clientSecret: config.idp.clientSecret || '',
-      scopes: ['openid', 'profile', 'email', 'cert:issue'],
-      config,
-    });
-
-    const start = await idp.startDeviceAuthorization({
-      scopes: ['openid', 'profile', 'email', 'cert:issue'],
-      clientId: idp.clientId,
-    });
-
-    // Kullanıcıya ve ön yüze gerekli bilgileri dönüyoruz
-    ctx.json(200, {
-      deviceCode: start.deviceCode,
-      userCode: start.userCode,
-      verificationUri: start.verificationUri,
-      verificationUriComplete: start.verificationUriComplete,
-      interval: start.interval || 5,
-      expiresIn: start.expiresIn || 600,
-    });
-  });
-
-  // 2. Adım: Onay geldikten sonra token'ı al ve sertifikayı üret
-  router.post('/api/v1/mailboxes/:mailbox/certificate/device-complete', async (ctx) => {
-    const session = await requireSession(ctx);
-    ctx.state.input = await ctx.input();
-    requireCsrf(ctx, session);
-    const { mailbox } = await resolveMailbox(ctx, session, ctx.params.mailbox, 'owner');
-    
-    const deviceCode = ctx.state.input.fields.deviceCode;
-    if (!deviceCode) throw new HttpError(400, 'deviceCode gerekli');
-
-    const { IdpClient } = require('../../auth/idp-client');
-    const idp = new IdpClient({
-      baseUrl: config.idp.baseUrl,
-      clientId: config.idp.deviceClientId || config.idp.clientId,
-      clientSecret: config.idp.deviceClientSecret || '',
-      scopes: ['openid', 'profile', 'email', 'cert:issue'],
-      config,
-    });
-
-    let tokens;
-    try {
-      tokens = await idp.pollDeviceToken({
-        deviceCode,
-        interval: 5,
-        expiresIn: 60, 
-        clientId: idp.clientId,
-        onPending: () => {},
-      });
-    } catch (err) {
-      throw new HttpError(400, 'Onay henüz verilmedi veya süre doldu: ' + err.message);
-    }
-
-    // 🟢 SİHİRLİ DOKUNUŞ BURADA: `accessToken` değil, `access_token`!
-    // JSON'dan gelen ham adı kullanıyoruz ki undefined olmasın.
-    const result = await certificates.ensureForMailbox(mailbox, {
-      force: true,
-      requestedBySub: session.idpSub,
-      userAccessToken: tokens.access_token || tokens.accessToken, // İhtiyatlı davranıp ikisini de kontrol ediyoruz
-    });
-
-    if (result.status === 'failed') throw new HttpError(502, `Sertifika alınamadı: ${result.reason}`);
-    ctx.json(200, { ok: true, ...result });
-  });
-
+  /**
+   * S/MIME sertifikası iste — KULLANICININ KENDİ KİMLİĞİYLE.
+   *
+   * ── BİLDİRİLEN HATA VE SEBEBİ ──────────────────────────────────────────
+   * Arayüzden sertifika istendiğinde IdP "Kullanıcı bulunamadı" diyordu.
+   * Sebep, isteğin sunucunun SERVİS jetonuyla (client_credentials)
+   * gönderilmesiydi: IdP sertifikanın sahibini yalnızca jetonun `sub`
+   * alanından belirliyor ve o alanda bir kullanıcı değil, istemcinin kendisi
+   * yazıyor. `users.get(sub)` boş dönüyor, hata "kullanıcı yok" olarak
+   * görünüyor — oysa sorulan kimlik yanlıştı.
+   *
+   * Doğru kimlik zaten elimizde: kullanıcı tarayıcıda IdP ile giriş yaptı ve
+   * erişim jetonu kasada duruyor. Onu kullanıyoruz. Sertifika böylece IdP'de
+   * o kullanıcıya yazılıyor, yönetim panelinde görünüyor ve RBAC
+   * (`certProfiles`) doğru kişiye uygulanıyor.
+   *
+   * Cihaz kodu akışı KALDIRILMADI ama artık gerekli değil: aynı sonucu
+   * kullanıcıyı ikinci bir ekrana göndermeden veriyoruz. Kapsam eksikse
+   * (yalnızca o zaman) bir onay turu gerekiyor.
+   */
   router.post('/api/v1/mailboxes/:mailbox/certificate/issue', async (ctx) => {
     const session = await requireSession(ctx);
     ctx.state.input = await ctx.input();
     requireCsrf(ctx, session);
     const { mailbox } = await resolveMailbox(ctx, session, ctx.params.mailbox, 'owner');
     if (!certificates) throw new HttpError(503, 'Sertifika yöneticisi yapılandırılmamış');
+    if (!certificates.available) {
+      throw new HttpError(503, '@fitfak/ssl yüklü değil — sertifika isteği hazırlanamıyor', { code: 'SSL_MISSING' });
+    }
+
+    const delegated = await sessions.idpAccessTokenFor(session, {
+      requiredScope: config.trust.issueScope,
+    });
+    if (!delegated.ok) {
+      // Kapsam eksik: kullanıcıyı onay turuna yönlendirebilmesi için arayüze
+      // adresi veriyoruz. 403 ile "yetkiniz yok" demek yanlış olurdu —
+      // yetkisi var, henüz istemedik.
+      const returnTo = String(ctx.state.input.fields.returnTo || '/');
+      throw new HttpError(409, delegated.message, {
+        code: delegated.code === 'scope_required' ? 'CERT_SCOPE_REQUIRED' : 'IDP_REAUTH_REQUIRED',
+        detail: {
+          requiredScope: config.trust.issueScope,
+          authorizeUrl: `/yetki-yukselt?kapsam=${encodeURIComponent(config.trust.issueScope)}`
+            + `&donus=${encodeURIComponent(returnTo)}`,
+        },
+      });
+    }
 
     const result = await certificates.ensureForMailbox(mailbox, {
       force: toBool(ctx.state.input.fields.force),
       requestedBySub: session.idpSub,
+      userAccessToken: delegated.accessToken,
     });
-    if (result.status === 'failed') throw new HttpError(502, `Sertifika alınamadı: ${result.reason}`);
+
+    if (result.status === 'failed' || result.status === 'skipped') {
+      logger.warn({
+        mailbox: mailbox.address, status: result.status, code: result.code,
+        reason: result.reason, msg: 'sertifika isteği başarısız',
+      });
+      throw new HttpError(result.retryable ? 503 : 502, result.reason, {
+        code: (result.code || 'CERT_FAILED').toUpperCase(),
+        detail: result.hint ? { hint: result.hint } : null,
+      });
+    }
     ctx.json(200, { ok: true, ...result });
+  });
+
+  /**
+   * Kullanıcının kendi cihazında ürettiği sertifikayı kaydeder.
+   *
+   * Özel anahtar İSTENMEZ. Bu yol, anahtarını sunucuya bırakmak istemeyen
+   * kullanıcı için: imzalamayı kendi istemcisi yapar, sunucu yalnızca
+   * doğrulama tarafı için sertifikayı tanır.
+   */
+  router.post('/api/v1/mailboxes/:mailbox/certificate/register', async (ctx) => {
+    const session = await requireSession(ctx);
+    ctx.state.input = await ctx.input();
+    requireCsrf(ctx, session);
+    const { mailbox } = await resolveMailbox(ctx, session, ctx.params.mailbox, 'owner');
+    if (!certificates) throw new HttpError(503, 'Sertifika yöneticisi yapılandırılmamış');
+
+    const certPem = String(ctx.state.input.fields.certPem || '');
+    if (!certPem.includes('BEGIN CERTIFICATE')) throw new HttpError(400, 'PEM biçiminde bir sertifika bekleniyor');
+    try {
+      const result = await certificates.registerUserCertificate({
+        address: mailbox.address,
+        certPem,
+        chainPem: String(ctx.state.input.fields.chainPem || ''),
+        requestedBySub: session.idpSub,
+        ip: ctx.ip,
+      });
+      ctx.json(200, { ok: true, ...result });
+    } catch (err) {
+      throw new HttpError(err.status || 400, err.message, { code: 'CERT_REGISTER_FAILED' });
+    }
+  });
+
+  /** IdP'nin bu kullanıcı adına verdiği tüm sertifikalar (uzaktan). */
+  router.get('/api/v1/mailboxes/:mailbox/certificate/remote', async (ctx) => {
+    const session = await requireSession(ctx);
+    await resolveMailbox(ctx, session, ctx.params.mailbox, 'owner');
+    if (!certificates) throw new HttpError(503, 'Sertifika yöneticisi yapılandırılmamış');
+
+    const delegated = await sessions.idpAccessTokenFor(session);
+    if (!delegated.ok) throw new HttpError(409, delegated.message, { code: 'IDP_REAUTH_REQUIRED' });
+    try {
+      ctx.json(200, { certificates: await certificates.listRemoteCertificates(delegated.accessToken) });
+    } catch (err) {
+      throw new HttpError(502, err.message, { code: err.code || 'IDP_UNAVAILABLE' });
+    }
   });
 
   /* ── bildirim abonelikleri ─────────────────────────────────── */

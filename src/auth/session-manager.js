@@ -71,6 +71,14 @@ class SessionManager {
     const stored = await this.stores.sessions.consumeEphemeral(`oauth:${state}`);
     if (!stored) throw new Error('state geçersiz ya da süresi dolmuş');
 
+    // Kapsam yükseltmesi (ör. sertifika için `cert:issue`) aynı geri dönüş
+    // adresini kullanıyor: IdP'de ikinci bir redirect_uri kaydetmek, aynı
+    // akışı iki yerde bakımı gereken iki yola bölerdi. Ayrım state'te.
+    if (stored.upgradeSessionRef) {
+      const result = await this.completeScopeUpgrade({ code, stored });
+      return { scopeUpgrade: true, ...result };
+    }
+
     const tokens = await this.idp.exchangeCode({ code, codeVerifier: stored.codeVerifier });
 
     let profile = null;
@@ -97,6 +105,7 @@ class SessionManager {
 
     const scopeList = tokens.scope ? tokens.scope.split(/\s+/).filter(Boolean) : profile.scope;
     const isAdmin = this.isAdminIdentity(profile);
+    await this.autoProvisionMailbox(profile);
     const mailboxes = await this.resolveMailboxes(profile);
 
     const session = await this.stores.sessions.create({
@@ -136,13 +145,118 @@ class SessionManager {
       profile,
       mailboxes,
       isAdmin,
+      noMailbox: mailboxes.length ? null : this.describeNoMailbox(profile),
     };
   }
 
   isAdminIdentity(profile) {
     if (profile.isAdmin) return true;
     if (this.config.idp.adminSubjects.includes(profile.sub)) return true;
+    // IdP'nin kendi yönetici kuralı TEK bir doğrulanmış adrese dayanıyor
+    // (bkz. oauth-server requireAdmin). Aynı kuralı burada da tanıyoruz;
+    // aksi hâlde IdP'de yönetici olan kişi posta tarafında olmuyordu.
+    const email = String(profile.email || '').toLowerCase();
+    if (email && profile.emailVerified !== false
+      && this.config.idp.adminEmails.includes(email)) return true;
     return profile.roles.some((role) => this.config.idp.adminRoles.includes(role));
+  }
+
+  /**
+   * Kendi alan adımızdaki doğrulanmış bir kimlik için posta kutusunu açar.
+   *
+   * ── BİLDİRİLEN HATA ────────────────────────────────────────────────────
+   * "Sistemde var olan e-posta adresleriyle giriş yapılabiliyor, ama
+   * karşılığı olmayan bir adresle (ör. bir Gmail adresi) girildiğinde
+   * karmaşa çıkıyor."
+   *
+   * Karmaşanın iki ayrı kaynağı vardı ve ikisi de burada ayrılıyor:
+   *
+   *   1. KENDİ alan adımızdan bir adresle giren kişinin kutusu henüz
+   *      açılmamış olabiliyordu. IdP o kişiyi tanıyor, adres bizim, ama
+   *      `mailboxesForIdentity` boş dönüyordu — kullanıcı "hesabım var ama
+   *      hiçbir şey yok" durumunda kalıyordu. Bu bir yetki sorunu değil,
+   *      eksik bir kayıt: kutuyu burada açıyoruz.
+   *
+   *   2. HARİCİ bir adresle (gmail.com) giren kişinin bir kutusu OLMAMALI.
+   *      Ona kutu açmak, bizim alan adımızda karşılığı olmayan bir kimliğe
+   *      posta kutusu vermek olurdu. Bu durum bir hata değil, bir yetki
+   *      durumudur ve `describeNoMailbox` ile açıkça anlatılır.
+   *
+   * Otomatik açma DOĞRULANMIŞ adres ister. Aksi hâlde IdP'de doğrulanmamış
+   * bir adresi "benim" diye yazan biri, o adresin kutusunu açtırabilirdi.
+   */
+  async autoProvisionMailbox(profile) {
+    if (!this.config.idp.autoProvisionMailbox) return null;
+    const email = normalizeAddress(profile.email);
+    if (!email || !email.includes('@')) return null;
+    if (profile.emailVerified === false) {
+      this.logger.warn({ email, msg: 'adres IdP tarafından doğrulanmamış, kutu açılmadı' });
+      return null;
+    }
+    const { domain } = require('../util/encoding').splitAddress(email);
+    if (!this.config.isLocalDomain(domain)) return null;
+
+    const existing = await this.stores.mailboxes.getByAddress(email);
+    if (existing) {
+      // Kutu var ama sahibi yazılmamışsa (elle ya da teslimatla açılmışsa)
+      // IdP öznesini bağlıyoruz: sahiplik adrese değil özneye bağlanmalı.
+      if (!existing.ownerSub && profile.sub) {
+        await this.stores.mailboxes.ensure(email, { ownerSub: profile.sub, ownerEmail: email });
+        this.logger.info({ mailbox: email, sub: profile.sub, msg: 'kutu sahibi IdP kimliğine bağlandı' });
+      }
+      return existing;
+    }
+
+    const { mailbox, created } = await this.stores.mailboxes.ensure(email, {
+      kind: 'user',
+      displayName: profile.name || profile.preferredUsername || '',
+      ownerSub: profile.sub,
+      ownerEmail: email,
+    });
+    if (created) {
+      this.logger.info({ mailbox: email, sub: profile.sub, msg: 'ilk girişte posta kutusu açıldı' });
+      await this.stores.audit.record({
+        actorSub: profile.sub, actorEmail: email, action: 'mailbox.auto_provision',
+        targetType: 'mailbox', targetId: mailbox.ref,
+        detail: { reason: 'IdP kimliği yerel alan adında ve doğrulanmış' },
+      });
+    }
+    return mailbox;
+  }
+
+  /**
+   * Erişilebilir kutu yoksa NEDENİNİ söyler.
+   *
+   * "Kutu yok" tek başına bir bilgi değil; kullanıcının ne yapması gerektiği
+   * bilgisi eksik. Üç ayrı durum var ve her birinin farklı bir çıkışı var.
+   */
+  describeNoMailbox(profile) {
+    const email = normalizeAddress(profile.email);
+    const { domain } = require('../util/encoding').splitAddress(email);
+    if (!email) {
+      return {
+        code: 'no_email',
+        message: 'Kimlik sağlayıcı bir posta adresi döndürmedi.',
+        action: 'Giriş isteğinde "email" kapsamı isteniyor mu, kontrol edin.',
+      };
+    }
+    if (this.config.isLocalDomain(domain)) {
+      return {
+        code: 'local_pending',
+        email,
+        message: `${email} bu sunucunun alan adında ama tanımlı bir posta kutusu yok.`,
+        action: profile.emailVerified === false
+          ? 'Adresinizi fitfak kimlik hesabınızda doğrulayın; doğrulandığında kutunuz kendiliğinden açılır.'
+          : 'Bir yöneticinin kutuyu oluşturması gerekiyor.',
+      };
+    }
+    return {
+      code: 'external_identity',
+      email,
+      message: `${email} harici bir adres; bu sunucuda karşılığı olan bir posta kutusu yok.`,
+      action: 'Bir yöneticinin bu adresi bir posta kutusuna bağlaması (kimlik bağı) gerekir. '
+        + 'Kendi alan adımızdaki bir adresle giriş yaparsanız kutunuz kendiliğinden açılır.',
+    };
   }
 
   async resolveMailboxes(profile) {
@@ -224,6 +338,135 @@ class SessionManager {
       this.logger.warn({ error: err.message, msg: 'oturum yeniden doğrulanamadı' });
       return false;
     }
+  }
+
+  /* ── kullanıcı adına IdP çağrıları ────────────────────────── */
+
+  /**
+   * Oturumun IdP erişim jetonunu, KULLANICI ADINA bir çağrıda kullanılmak
+   * üzere döndürür.
+   *
+   * Bu, sertifika verme akışının dayandığı nokta. IdP'nin sertifika servisi
+   * sahibi jetonun `sub` alanından belirliyor; dolayısıyla "bu kullanıcı için
+   * sertifika" demenin tek yolu, o kullanıcının kendi jetonuyla sormak.
+   * Servisin kendi jetonu (client_credentials) bir kullanıcıyı temsil etmez
+   * ve IdP onu haklı olarak reddeder.
+   *
+   * Kapsam denetimi ÖNCE yapılır: kapsamı olmayan bir jetonla gidip 403
+   * almak, kullanıcıya "bir şeyler ters gitti" demek olurdu. Kapsam eksikse
+   * arayüzün kullanıcıyı yeniden onaya yönlendirebilmesi için açık bir kod
+   * döner.
+   *
+   * @returns {Promise<{ok: boolean, accessToken?: string, code?: string, ...}>}
+   */
+  async idpAccessTokenFor(session, { requiredScope = null } = {}) {
+    if (!session || session.isApiToken) {
+      return { ok: false, code: 'not_interactive', message: 'Bu işlem tarayıcı oturumu gerektirir.' };
+    }
+
+    const scopes = String(session.scope || '').split(/\s+/).filter(Boolean);
+    if (requiredScope && !scopes.includes(requiredScope)) {
+      return {
+        ok: false,
+        code: 'scope_required',
+        requiredScope,
+        grantedScopes: scopes,
+        message: `Oturumunuz "${requiredScope}" kapsamını taşımıyor.`,
+      };
+    }
+
+    let accessToken = await this.stores.sessions.getAccessToken(session);
+    if (accessToken) {
+      // Jeton hâlâ geçerli mi? Süresi dolmuş bir jetonla IdP'ye gitmek 401
+      // döner ve o 401, arayüzde "sertifika alınamadı" olarak görünür.
+      const active = await this.idp.introspect(accessToken, { cacheMs: 10_000 })
+        .then((info) => info && info.active !== false)
+        .catch((err) => (err.temporary ? true : false));
+      if (active) return { ok: true, accessToken, scopes, refreshed: false };
+      this.logger.debug({ email: session.idpEmail, msg: 'IdP erişim jetonu geçersiz, yenileniyor' });
+      accessToken = null;
+    }
+
+    const refreshToken = await this.stores.sessions.getRefreshToken(session);
+    if (!refreshToken) {
+      return {
+        ok: false,
+        code: 'reauth_required',
+        message: 'IdP oturum jetonu yok ya da süresi dolmuş. Yeniden giriş yapmanız gerekiyor.',
+      };
+    }
+
+    try {
+      const tokens = await this.idp.refresh(refreshToken);
+      if (!tokens.accessToken) throw new Error('access_token dönmedi');
+      await this.stores.sessions.updateIdpTokens(session, {
+        accessToken: tokens.accessToken,
+        refreshToken: tokens.refreshToken,
+        scope: tokens.scope || session.scope,
+      });
+      return {
+        ok: true,
+        accessToken: tokens.accessToken,
+        scopes: String(tokens.scope || session.scope || '').split(/\s+/).filter(Boolean),
+        refreshed: true,
+      };
+    } catch (err) {
+      this.logger.warn({ email: session.idpEmail, error: err.message, msg: 'IdP jetonu yenilenemedi' });
+      return {
+        ok: false,
+        code: 'reauth_required',
+        message: `IdP jetonu yenilenemedi: ${err.message}`,
+      };
+    }
+  }
+
+  /**
+   * Eksik bir kapsam için yeniden yetkilendirme adresi üretir.
+   *
+   * Kullanıcı buraya gidip onay verdiğinde geri döner ve kod jetona
+   * çevrilerek AYNI yerel oturuma yazılır — yeni bir oturum açılmaz, çünkü
+   * kullanıcı zaten giriş yapmış durumda ve onu tekrar giriş ekranına atmak
+   * yaptığı işi kaybettirirdi.
+   */
+  async beginScopeUpgrade({ session, scope, returnTo = '/', ip = '', userAgent = '' }) {
+    const requested = [...new Set([...String(session.scope || '').split(/\s+/).filter(Boolean), scope])];
+    const request = this.idp.createAuthorizationRequest({
+      scopes: requested,
+      prompt: 'consent',
+      loginHint: session.idpEmail || null,
+    });
+    await this.stores.sessions.putEphemeral(`oauth:${request.state}`, {
+      codeVerifier: request.codeVerifier,
+      nonce: request.nonce,
+      ip,
+      userAgent: String(userAgent).slice(0, 200),
+      returnTo: sanitizeReturnTo(returnTo),
+      upgradeSessionRef: session.ref,
+      requestedScope: scope,
+      createdAt: Date.now(),
+    }, { kind: 'oauth-state', ttlMs: 10 * 60_000 });
+    return { url: request.url, state: request.state, scopes: requested };
+  }
+
+  /**
+   * Kapsam yükseltme dönüşü: kodu jetona çevirir ve MEVCUT oturuma yazar.
+   * @returns {Promise<{upgraded: boolean, returnTo: string, scope: string}>}
+   */
+  async completeScopeUpgrade({ code, stored }) {
+    const tokens = await this.idp.exchangeCode({ code, codeVerifier: stored.codeVerifier });
+    const target = await this.stores.sessions.getByRef(stored.upgradeSessionRef);
+    if (!target) {
+      const err = new Error('yükseltilecek oturum bulunamadı ya da kapatılmış');
+      err.status = 401;
+      throw err;
+    }
+    await this.stores.sessions.updateIdpTokens(target, {
+      accessToken: tokens.accessToken,
+      refreshToken: tokens.refreshToken,
+      scope: tokens.scope,
+    });
+    this.logger.info({ scope: tokens.scope, msg: 'oturum kapsamı yükseltildi' });
+    return { upgraded: true, returnTo: stored.returnTo || '/', scope: tokens.scope };
   }
 
   async logout({ sid, revokeIdpSessions = false }) {

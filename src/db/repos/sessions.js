@@ -109,6 +109,13 @@ class SessionRepo {
     return SessionRepo.shape(row);
   }
 
+  async getByRef(sessionRef) {
+    if (!sessionRef) return null;
+    const row = await this.sessions.get(String(sessionRef)).catch(() => null);
+    if (!row || row.revoked) return null;
+    return SessionRepo.shape(row);
+  }
+
   async touch(sessionRef, { ip = null, revalidated = false } = {}) {
     const patch = { lastSeenAt: Date.now() };
     if (ip) patch.ip = ip;
@@ -198,6 +205,44 @@ class SessionRepo {
     if (!this.vault || !session.accessTokenSecretRef) return null;
     const secret = await this.vault.get('idp-token', session.accessTokenSecretRef).catch(() => null);
     return secret ? secret.value.toString('utf8') : null;
+  }
+
+  async getRefreshToken(session) {
+    if (!this.vault || !session.refreshTokenSecretRef) return null;
+    const secret = await this.vault.get('idp-token', session.refreshTokenSecretRef).catch(() => null);
+    return secret ? secret.value.toString('utf8') : null;
+  }
+
+  /**
+   * Yenilenmiş IdP jetonlarını oturuma yazar.
+   *
+   * Kasa adları DEĞİŞMEZ, sürüm artar. Ad oturum kimliğinden türetiliyor;
+   * her yenilemede yeni bir ad üretmek kasada oturum başına sınırsız kayıt
+   * bırakırdı ve eskilerini kimin temizleyeceği belirsiz kalırdı.
+   */
+  async updateIdpTokens(session, { accessToken = null, refreshToken = null, scope = null } = {}) {
+    const patch = {};
+    if (this.vault && accessToken) {
+      const name = session.accessTokenSecretRef
+        || `session/${String(session.ref).slice(0, 24)}/access`;
+      await this.vault.put({
+        kind: 'idp-token', name, value: accessToken,
+        contentType: 'application/jwt', notAfter: session.expiresAt,
+      });
+      patch.accessTokenSecretRef = name;
+    }
+    if (this.vault && refreshToken) {
+      const name = session.refreshTokenSecretRef
+        || `session/${String(session.ref).slice(0, 24)}/refresh`;
+      await this.vault.put({
+        kind: 'idp-token', name, value: refreshToken,
+        contentType: 'text/plain', notAfter: session.expiresAt,
+      });
+      patch.refreshTokenSecretRef = name;
+    }
+    if (scope != null) patch.scope = String(scope);
+    if (Object.keys(patch).length) await this.sessions.update(String(session.ref), patch);
+    return patch;
   }
 
   async sweepExpired({ limit = 500 } = {}) {

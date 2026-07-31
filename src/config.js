@@ -272,6 +272,14 @@ const IDP = {
   // bunlara açık.
   adminRoles: list('FITFAK_IDP_ADMIN_ROLES', 'idp.adminRoles', ['admin']),
   adminSubjects: list('FITFAK_IDP_ADMIN_SUBJECTS', 'idp.adminSubjects', []),
+  // fitfak-idp'nin kendi yönetici kuralı TEK bir doğrulanmış adrese dayanır
+  // (core/config.js -> adminEmail). Aynı adresi burada da tanımak, IdP'de
+  // yönetici olan kişinin posta tarafında yönetici olmamasını engelliyor.
+  adminEmails: list('FITFAK_IDP_ADMIN_EMAILS', 'idp.adminEmails', []).map(lower),
+  // Kendi alan adımızdaki DOĞRULANMIŞ bir kimlik ilk kez giriş yaptığında
+  // posta kutusunu aç. Harici adresler (gmail.com vb.) buna dâhil DEĞİLDİR;
+  // onlar için yöneticinin kurduğu bir kimlik bağı gerekir.
+  autoProvisionMailbox: bool('FITFAK_MAIL_AUTO_PROVISION', 'idp.autoProvisionMailbox', true),
   introspectPath: pick('FITFAK_IDP_INTROSPECT_PATH', 'idp.introspectPath', '/oauth/introspect'),
   userinfoPath: pick('FITFAK_IDP_USERINFO_PATH', 'idp.userinfoPath', '/oauth/userinfo'),
   tokenPath: pick('FITFAK_IDP_TOKEN_PATH', 'idp.tokenPath', '/oauth/token'),
@@ -290,16 +298,26 @@ const IDP = {
    ───────────────────────────────────────────────────────────── */
 const TRUST = {
   baseUrl: String(pick('FITFAK_TRUST_BASE_URL', 'trust.baseUrl', 'https://trust.fitfak.net')).replace(/\/+$/, ''),
-  // Cihaz akışıyla (kullanıcı adına) sertifika: /device/certificate
+  // Sertifika verme uç noktası. IdP tarafında tek bir yol var
+  // (/device/certificate) ve sertifikanın SAHİBİ yola göre değil, taşınan
+  // jetona göre belirleniyor — bkz. certs/manager.js başındaki not.
   devicePath: pick('FITFAK_TRUST_DEVICE_PATH', 'trust.devicePath', '/device/certificate'),
-  // Servis kimliğiyle (posta sunucusu adına) sertifika.
-  servicePath: pick('FITFAK_TRUST_SERVICE_PATH', 'trust.servicePath', '/device/certificate'),
+  certificatesPath: pick('FITFAK_TRUST_CERTS_PATH', 'trust.certificatesPath', '/device/certificates'),
+  revokePath: pick('FITFAK_TRUST_REVOKE_PATH', 'trust.revokePath', '/device/certificate/revoke'),
   smimeProfile: pick('FITFAK_TRUST_SMIME_PROFILE', 'trust.smimeProfile', 'smime'),
-  caBundlePath: pick('FITFAK_TRUST_CA_PATH', 'trust.caBundlePath', '/root/idp/.certs/root_ca.crt'),
+  caBundlePath: pick('FITFAK_TRUST_CA_PATH', 'trust.caBundlePath', ''),
   // S/MIME sertifikaları ömrünün bu oranında yenilenir.
   renewAtLifetimeRatio: Number(pick('FITFAK_TRUST_RENEW_RATIO', 'trust.renewAtLifetimeRatio', 0.66)),
   autoIssue: bool('FITFAK_TRUST_AUTO_ISSUE', 'trust.autoIssue', false),
   checkIntervalMs: int('FITFAK_TRUST_CHECK_MS', 'trust.checkIntervalMs', 6 * 60 * 60 * 1000),
+  // Servis (client_credentials) kimliğiyle sertifika istemeye izin. YALNIZCA
+  // sistem kutuları için anlamlıdır: o jetonun öznesi bir kullanıcı değil,
+  // uygulamanın kendisidir ve IdP kullanıcı kutularına o kimlikle sertifika
+  // vermez ("Kullanıcı bulunamadı" hatasının kaynağı buydu).
+  allowServiceIdentity: bool('FITFAK_TRUST_ALLOW_SERVICE_IDENTITY', 'trust.allowServiceIdentity', false),
+  // Sertifika istemek için gereken kapsam. Kullanıcının oturum jetonunda bu
+  // kapsam yoksa arayüz yeniden onay (consent) turuna yönlendirir.
+  issueScope: pick('FITFAK_TRUST_ISSUE_SCOPE', 'trust.issueScope', 'cert:issue'),
 };
 
 /* ─────────────────────────────────────────────────────────────
@@ -385,8 +403,13 @@ const SITE = {
 };
 
 const LOG = {
+  // trace | debug | info | warn | error | silent
+  // `trace` protokol seviyesini açar (SMTP komutları, IdP istek/yanıtları,
+  // DKIM imza girdisi). Sırlar her seviyede maskelenir ama trace yine de
+  // ileti üstverisi yazar; üretimde geçici olarak açılmalıdır.
   level: lower(pick('LOG_LEVEL', 'log.level', IS_PROD ? 'info' : 'debug')),
   json: bool('LOG_JSON', 'log.json', IS_PROD),
+  color: bool('LOG_COLOR', 'log.color', !IS_PROD),
   // Kayıtlarda posta adreslerini maskeler. Üretimde açık: log dosyası,
   // veritabanının şifrelediği veriyi düz metin sızdıran yer olmamalı.
   redactAddresses: bool('LOG_REDACT_ADDRESSES', 'log.redactAddresses', IS_PROD),

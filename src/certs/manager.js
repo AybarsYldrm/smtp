@@ -9,34 +9,84 @@ const { URL } = require('node:url');
 const { createSmimeRequest, isAvailable: sslAvailable, inspectRequest } = require('./csr');
 const { normalizeAddress } = require('../util/encoding');
 const { createInterval } = require('../util/async');
+const log = require('../util/log');
 
 /**
  * S/MIME sertifika yöneticisi.
  *
- * "Sistemde kayıtlı her eposta adresi için sertifika tamamlanmış olacaktır"
- * gereğinin karşılığı: her etkin posta kutusu için bir S/MIME sertifikası
- * bulunur, süresi dolmadan yenilenir ve özel anahtarı kasada durur.
+ * ── BİLDİRİLEN HATA: "kullanıcı bulunamadı" ──────────────────────────────
  *
- * Sertifikayı BİZ ÜRETMİYORUZ — trust.fitfak.net üretiyor. Buradaki iş,
- * @fitfak/ssl ile anahtar ve istek (CSR) hazırlamak, isteği kimlik
- * doğrulamasıyla göndermek ve dönen sertifikayı kasaya yazmak. Özel anahtar
- * bu süreçte hiçbir yere gitmiyor: CSR ile istemenin bütün anlamı bu.
+ * Sertifikayı biz üretmiyoruz; fitfak-idp'nin sertifika servisi üretiyor
+ * (trust.fitfak.net/device/certificate). O uç nokta isteği ŞÖYLE çözüyor:
  *
- * İki yol:
- *   - SERVİS YOLU: sunucu, kendi jetonuyla kutular adına sertifika ister.
- *     Otomatik ve arka planda.
- *   - CİHAZ YOLU: kullanıcı kendi cihazında (CLI) cihaz kodu akışıyla giriş
- *     yapar, sertifikayı kendi adına alır. Özel anahtar kullanıcının
- *     makinesinde kalır; sunucu yalnızca sertifikayı (açık veriyi) kaydeder.
+ *     resolveCurrentSession(req) -> access token doğrulanır
+ *       payload.sid varsa  -> userId = payload.sub  (KULLANICI oturumu)
+ *       payload.sid yoksa  -> userId = payload.sub  ("m2m_session")
+ *     certificateService.requestCertificate({ userId, ... })
+ *       users.get(userId) -> yoksa AppError('user_not_found')
+ *
+ * Yani IdP, sertifikanın sahibini YALNIZCA jetonun öznesinden (`sub`)
+ * belirliyor; gövdedeki `userId` alanına hiç bakmıyor. `client_credentials`
+ * ile alınan bir jetonda `sub` bir KULLANICI değil, İSTEMCİNİN kendisidir —
+ * dolayısıyla `users.get(sub)` her zaman boş döner ve istek "Kullanıcı
+ * bulunamadı" ile reddedilir. Hata mesajı yanıltıcı: kullanıcı gerçekten
+ * yok değil, yanlış kimlikle soruluyor.
+ *
+ * Buradaki çözüm bunu bir yapılandırma sorunu olmaktan çıkarıp bir TÜR
+ * sorunu yapıyor: her istek açık bir `identity` ile gelir.
+ *
+ *   identity: 'user'     -> taşıyıcı jeton, o kullanıcının KENDİ IdP erişim
+ *                           jetonudur (tarayıcı oturumundan ya da cihaz kodu
+ *                           akışından). Sertifika IdP'de o kullanıcıya
+ *                           yazılır, yönetim panelinde görünür, RBAC
+ *                           (`certProfiles`) ona göre uygulanır.
+ *   identity: 'service'  -> client_credentials. Sertifika UYGULAMANIN kendi
+ *                           adına üretilir. Bir kullanıcı posta kutusu için
+ *                           KULLANILAMAZ; IdP kabul etmez ve etmemeli.
+ *
+ * Bir kullanıcı kutusu için servis jetonuna düşmek yasak: eskiden yapılan
+ * buydu ve ortaya çıkan hata, IdP'de o kullanıcının olmamasıymış gibi
+ * görünüyordu.
  */
+
+/** IdP'nin döndürdüğü hata kodları -> ne yapılması gerektiği. */
+const IDP_ERROR_HINTS = {
+  user_not_found:
+    'IdP bu jetonun sahibini bir kullanıcı olarak tanımadı. Sertifika, kullanıcının '
+    + 'KENDİ oturum jetonuyla istenmelidir; servis (client_credentials) jetonu yalnızca '
+    + 'uygulamanın kendi sertifikaları için geçerlidir.',
+  profile_not_allowed:
+    'IdP bu hesabın bu profilde sertifika almasına izin vermiyor. fitfak kimlik yönetim '
+    + 'panelinde Kullanıcılar > Sertifika yetkileri altından ilgili profili işaretleyin.',
+  key_already_certified:
+    'Bu açık anahtar için zaten bir sertifika üretilmiş. Yenilemek için yeni bir anahtar '
+    + 'çifti üretilmeli (force ile yeniden deneyin).',
+  unauthenticated:
+    'IdP oturumu geçersiz ya da süresi dolmuş. Kullanıcının yeniden giriş yapması gerekir.',
+  invalid_csr: 'Sertifika isteği (CSR) IdP tarafından biçimsel olarak reddedildi.',
+  forbidden: 'IdP isteği yetki nedeniyle reddetti.',
+};
+
+class CertificateError extends Error {
+  constructor(message, { code = null, status = 0, hint = null, retryable = false } = {}) {
+    super(message);
+    this.name = 'CertificateError';
+    this.code = code;
+    this.status = status;
+    this.hint = hint;
+    this.retryable = retryable;
+  }
+}
+
 class CertificateManager {
   constructor({ config, logger, stores, serviceToken = null, signer = null }) {
     this.config = config;
-    this.logger = logger;
+    this.logger = logger || log.child('cert');
     this.stores = stores;
     this.serviceToken = serviceToken;
     this.signer = signer;
     this.sweeper = null;
+    this._caBundle = undefined;
   }
 
   get available() { return sslAvailable(); }
@@ -48,40 +98,189 @@ class CertificateManager {
    *
    * @param {object} p
    * @param {string} p.csrPem
-   * @param {string} p.profile      @fitfak/ssl profil adı ('email' = S/MIME)
+   * @param {string} p.profile      IdP profil adı ('smime', 'client-auth', …)
    * @param {string} p.accessToken  taşıyıcı jeton
-   * @param {string} [p.path]       uç nokta (servis ya da cihaz)
+   * @param {'user'|'service'} p.identity  jetonun kimin adına konuştuğu
+   * @param {string} [p.path]       uç nokta
    */
-  async requestCertificate({ csrPem, profile = null, accessToken, path = null, extra = {}, requestedBySub = '' }) {
-    const endpoint = `${this.config.trust.baseUrl}${path || this.config.trust.servicePath}`;
+  async requestCertificate({
+    csrPem, profile = null, accessToken, identity = 'user', path = null,
+    extra = {}, requestedBySub = '',
+  }) {
+    if (!accessToken) {
+      throw new CertificateError('sertifika isteği için taşıyıcı jeton yok', { code: 'no_token' });
+    }
+    const endpoint = `${this.config.trust.baseUrl}${path || this.config.trust.devicePath}`;
+    const effectiveProfile = profile || this.config.trust.smimeProfile;
+
+    // Gövdedeki `userId` IdP tarafından YOK SAYILIYOR (sahip jetondan gelir).
+    // Yine de gönderiyoruz: IdP tarafındaki kayıtlarda isteği başlatanın kim
+    // olduğunu görmek, "bu sertifikayı kim istedi" sorusunu cevaplıyor.
     const payload = JSON.stringify({
       csrPem,
-      profile: profile || this.config.trust.smimeProfile,
-      userId: requestedBySub,
+      profile: effectiveProfile,
+      requestedBySub: requestedBySub || '',
       ...extra,
     });
 
-    const response = await httpJson('POST', endpoint, payload, {
-      'content-type': 'application/json',
-      accept: 'application/json',
-      authorization: `Bearer ${accessToken}`,
-      // Origin başlığı: trust sunucusu tarayıcı dışı istemcileri de
-      // Origin'e göre süzüyor (bkz. device-client örneği).
-      origin: this.config.trust.baseUrl,
-      'user-agent': 'Fitfak-Mail/2.0',
-    }, this.config.trust.caBundlePath);
+    const done = this.logger.timer('sertifika isteği');
+    let response;
+    try {
+      response = await this._postJson(endpoint, payload, {
+        // IdP'nin `requireTrustOrigin` kapısı Origin başlığına bakıyor ve
+        // yalnızca ISSUER ile TRUST_ISSUER'ı kabul ediyor. Tarayıcı dışı bir
+        // istemciyiz, o yüzden başlığı kendimiz koyuyoruz — koymazsak istek
+        // "köken yok" diye reddedilir ve hata, sertifikayla ilgisi olmayan
+        // bir 403 olarak görünür.
+        origin: this.config.idp.baseUrl,
+        referer: `${this.config.idp.baseUrl}/`,
+        authorization: `Bearer ${accessToken}`,
+      });
+    } catch (err) {
+      done({ ok: false, profile: effectiveProfile, identity });
+      throw err;
+    }
 
     const data = response.json || {};
     const certPem = data.certPem || data.certificate || data.cert;
     if (!certPem) {
-      throw new Error(`sertifika sunucusu sertifika döndürmedi: ${JSON.stringify(data).slice(0, 300)}`);
+      throw new CertificateError(
+        `sertifika sunucusu sertifika döndürmedi: ${log.snippet(response.raw, 200)}`,
+        { code: 'no_certificate', status: response.status },
+      );
     }
-    return {
+
+    const issued = {
       certPem,
       chainPem: data.chainPem || data.chain || data.caPem || '',
-      serialHex: data.serialNumber || data.serialHex || '',
-      issuedVia: path === this.config.trust.devicePath ? 'device-code' : 'service-token',
+      serialHex: data.serialNumberHex || data.serialNumber || data.serialHex || '',
+      notBefore: data.notBefore || null,
+      notAfter: data.notAfter || null,
+      issuedVia: identity === 'service' ? 'service-token' : 'user-token',
     };
+    done({ ok: true, profile: effectiveProfile, identity, serialHex: issued.serialHex });
+    return issued;
+  }
+
+  /** Kullanıcının IdP'deki sertifikalarını listeler (yalnızca kullanıcı jetonuyla). */
+  async listRemoteCertificates(accessToken) {
+    const endpoint = `${this.config.trust.baseUrl}${this.config.trust.certificatesPath}`;
+    const response = await this._request('GET', endpoint, null, {
+      origin: this.config.idp.baseUrl,
+      authorization: `Bearer ${accessToken}`,
+    });
+    return (response.json && response.json.certificates) || [];
+  }
+
+  _postJson(url, payload, headers) {
+    return this._request('POST', url, payload, { 'content-type': 'application/json', ...headers });
+  }
+
+  /**
+   * CA paketi bir kez okunur.
+   *
+   * Önceki sürüm her istekte diskten okuyor ve okuma başarısız olduğunda
+   * yalnızca ekrana yazıp devam ediyordu — yani yanlış yapılandırılmış bir
+   * yolda TLS doğrulaması sessizce sistem köklerine düşüyordu. Artık okuma
+   * bir kez yapılır ve sonucu (başarılı ya da başarısız) kayda geçer.
+   */
+  _caBundleOrNull() {
+    if (this._caBundle !== undefined) return this._caBundle;
+    const caPath = this.config.trust.caBundlePath;
+    if (!caPath) {
+      this.logger.debug({ msg: 'trust CA paketi ayarlanmamış, sistem kökleri kullanılacak' });
+      this._caBundle = null;
+      return null;
+    }
+    try {
+      const ca = require('node:fs').readFileSync(caPath);
+      // Sistem kökleri SİLİNMEZ, kendi kökümüz EKLENİR: trust.fitfak.net'in
+      // önünde herkese açık bir sertifika (Cloudflare) durabiliyor.
+      this._caBundle = [...tls.rootCertificates, ca.toString('utf8')];
+      this.logger.info({ caPath, msg: 'trust CA paketi yüklendi' });
+    } catch (err) {
+      this.logger.warn({ caPath, error: err.message, msg: 'trust CA paketi okunamadı, sistem kökleriyle devam ediliyor' });
+      this._caBundle = null;
+    }
+    return this._caBundle;
+  }
+
+  _request(method, url, payload, headers) {
+    const target = new URL(url);
+    const transport = target.protocol === 'https:' ? https : http;
+    const finalHeaders = {
+      accept: 'application/json',
+      'user-agent': 'Fitfak-Mail/2.0',
+      ...headers,
+    };
+    if (payload != null) finalHeaders['content-length'] = Buffer.byteLength(payload);
+
+    const options = {
+      method,
+      hostname: target.hostname,
+      port: target.port || (target.protocol === 'https:' ? 443 : 80),
+      path: `${target.pathname}${target.search}`,
+      headers: finalHeaders,
+    };
+    const ca = this._caBundleOrNull();
+    if (ca) options.ca = ca;
+
+    this.logger.http('→ trust', {
+      method, url, headers: log.safeHeaders(finalHeaders), body: payload ? log.snippet(payload, 300) : undefined,
+    });
+
+    return new Promise((resolve, reject) => {
+      const req = transport.request(options, (res) => {
+        const chunks = [];
+        res.on('data', (chunk) => chunks.push(chunk));
+        res.on('end', () => {
+          const raw = Buffer.concat(chunks).toString('utf8');
+          this.logger.http('← trust', {
+            method, url, status: res.statusCode, body: log.snippet(raw, 400),
+          });
+
+          let parsed = null;
+          try { parsed = JSON.parse(raw); } catch { /* JSON değil (proxy hata sayfası olabilir) */ }
+
+          if (res.statusCode >= 200 && res.statusCode < 300) {
+            resolve({ status: res.statusCode, json: parsed, raw });
+            return;
+          }
+          reject(this._describeFailure(res.statusCode, parsed, raw));
+        });
+      });
+
+      req.setTimeout(30_000, () => {
+        req.destroy();
+        reject(new CertificateError('sertifika sunucusu zaman aşımı (30s)', {
+          code: 'timeout', retryable: true,
+        }));
+      });
+      req.on('error', (err) => reject(new CertificateError(
+        `sertifika sunucusuna erişilemedi: ${err.message}`,
+        { code: err.code || 'network', retryable: true },
+      )));
+      if (payload != null) req.write(payload);
+      req.end();
+    });
+  }
+
+  /**
+   * IdP hatasını anlaşılır bir hataya çevirir.
+   *
+   * Önceki sürüm ham gövdeyi mesaja koyuyordu; kullanıcı arayüzünde
+   * "Kullanıcı bulunamadı" görünüyordu ve bu, yanlış soruyu sordurtuyordu
+   * ("kullanıcıyı IdP'ye ekledim, hâlâ olmuyor"). Artık hangi kimliğin
+   * kullanıldığı ve ne yapılması gerektiği mesajın parçası.
+   */
+  _describeFailure(status, parsed, raw) {
+    const code = (parsed && (parsed.error || parsed.code)) || `http_${status}`;
+    const description = (parsed && (parsed.error_description || parsed.message)) || log.snippet(raw, 200);
+    const hint = IDP_ERROR_HINTS[code] || null;
+    return new CertificateError(
+      `sertifika sunucusu reddetti (HTTP ${status}, ${code}): ${description}`,
+      { code, status, hint, retryable: status >= 500 || status === 429 },
+    );
   }
 
   /* ── kutu başına sertifika ─────────────────────────────────── */
@@ -91,22 +290,25 @@ class CertificateManager {
    *
    * @param {object} mailbox
    * @param {object} [opts]
-   * @param {boolean} [opts.force=false]  süresi dolmamış olsa da yenile
+   * @param {boolean} [opts.force=false]        süresi dolmamış olsa da yenile
+   * @param {string}  [opts.userAccessToken]    kullanıcının IdP erişim jetonu
+   * @param {string}  [opts.requestedBySub]     isteği başlatan IdP öznesi
+   * @param {boolean} [opts.allowServiceToken]  sistem kutuları için servis jetonuna izin
    */
-  async ensureForMailbox(mailbox, { force = false, requestedBySub = '' } = {}) {
+  async ensureForMailbox(mailbox, {
+    force = false, requestedBySub = '', userAccessToken = null, allowServiceToken = null,
+  } = {}) {
+    const address = normalizeAddress(mailbox.address);
+    const logger = this.logger.child(address);
+
     if (!this.available) {
-      return { status: 'skipped', reason: '@fitfak/ssl yüklü değil' };
+      return { status: 'skipped', reason: '@fitfak/ssl yüklü değil', code: 'ssl_missing' };
     }
     if (mailbox.smimeEnabled === false) {
-      return { status: 'skipped', reason: 'kutuda S/MIME kapalı' };
-    }
-    if (!this.serviceToken) {
-      return { status: 'skipped', reason: 'servis jetonu sağlayıcısı yok' };
+      return { status: 'skipped', reason: 'kutuda S/MIME kapalı', code: 'smime_disabled' };
     }
 
-    const address = normalizeAddress(mailbox.address);
     const existing = await this.stores.certificates.get('smime', address);
-
     if (existing && !force) {
       const now = Date.now();
       const active = existing.status === 'active';
@@ -115,6 +317,24 @@ class CertificateManager {
       if (active && notExpired && notDueForRenewal) {
         return { status: 'current', notAfter: existing.notAfter, serialHex: existing.serialHex };
       }
+    }
+
+    // Hangi kimlikle isteyeceğimize BURADA karar veriliyor ve karar tek
+    // kurala dayanıyor: sertifika bir kişiye mi yoksa uygulamaya mı ait?
+    const identity = this._identityFor(mailbox, { userAccessToken, allowServiceToken });
+    if (!identity.ok) {
+      logger.warn({ reason: identity.reason, msg: 'S/MIME sertifikası istenemedi' });
+      return { status: 'skipped', reason: identity.reason, code: identity.code, hint: identity.hint };
+    }
+
+    let accessToken;
+    try {
+      accessToken = identity.kind === 'user'
+        ? identity.accessToken
+        : await this.serviceToken.getAccessToken();
+    } catch (err) {
+      logger.error({ error: err.message, msg: 'jeton alınamadı' });
+      return { status: 'failed', reason: err.message, code: 'token_unavailable' };
     }
 
     const request = createSmimeRequest({
@@ -130,21 +350,34 @@ class CertificateManager {
     if (!inspected.emails.includes(address)) {
       throw new Error(`CSR SAN'ında adres yok: ${address}`);
     }
+    logger.debug({
+      profile: this.config.trust.smimeProfile,
+      identity: identity.kind,
+      keyAlgorithm: request.algorithmLabel,
+      san: inspected.emails.join(','),
+      msg: 'CSR hazırlandı',
+    });
 
     let issued;
     try {
-      const accessToken = await this.serviceToken.getAccessToken();
-
       issued = await this.requestCertificate({
         csrPem: request.csrPem,
         profile: this.config.trust.smimeProfile,
         accessToken,
+        identity: identity.kind,
         requestedBySub,
         extra: { subjectAddress: address, mailboxRef: mailbox.ref },
       });
     } catch (err) {
-      this.logger.error({ mailbox: address, error: err.message, msg: 'S/MIME sertifikası alınamadı' });
-      return { status: 'failed', reason: err.message };
+      logger.error({
+        error: err.message, code: err.code, identity: identity.kind,
+        hint: err.hint || undefined,
+        msg: 'S/MIME sertifikası alınamadı',
+      });
+      return {
+        status: 'failed', reason: err.message, code: err.code || 'request_failed',
+        hint: err.hint || null, retryable: !!err.retryable,
+      };
     }
 
     const stored = await this.stores.certificates.store({
@@ -162,24 +395,74 @@ class CertificateManager {
 
     if (this.signer) this.signer.invalidate(address);
     await this.stores.audit.record({
-      actorSub: requestedBySub, actorEmail: address,
-      action: 'certificate.issue', targetType: 'mailbox', targetId: mailbox.ref,
-      detail: { usage: 'smime', version: stored.version, issuedVia: issued.issuedVia },
+      actorSub: requestedBySub,
+      actorEmail: address,
+      action: 'certificate.issue',
+      targetType: 'mailbox',
+      targetId: mailbox.ref,
+      detail: { usage: 'smime', version: stored.version, issuedVia: issued.issuedVia, identity: identity.kind },
     });
-    this.logger.info({
-      mailbox: address, version: stored.version, issuedVia: issued.issuedVia,
+    logger.info({
+      version: stored.version, issuedVia: issued.issuedVia, serialHex: issued.serialHex,
       msg: 'S/MIME sertifikası verildi',
     });
 
-    return { status: existing ? 'renewed' : 'issued', version: stored.version, ref: stored.ref };
+    return {
+      status: existing ? 'renewed' : 'issued',
+      version: stored.version,
+      ref: stored.ref,
+      issuedVia: issued.issuedVia,
+      serialHex: issued.serialHex,
+    };
   }
 
-  /** Bütün etkin kutular için sertifika sağlar. */
-  async ensureAll({ force = false } = {}) {
-    const mailboxes = (await this.stores.mailboxes.listAll())
-      .filter((m) => m.status === 'active' && m.kind !== 'alias');
-    const summary = { total: mailboxes.length, issued: 0, renewed: 0, current: 0, failed: 0, skipped: 0 };
+  /**
+   * Hangi kimliğin kullanılacağı.
+   *
+   * Kullanıcı kutuları için servis jetonuna DÜŞÜLMEZ. Düşmek, IdP'nin
+   * anlamsız bir "kullanıcı bulunamadı" ile reddetmesi demek — ve o hata,
+   * sorunun IdP'deki kullanıcı kaydında olduğunu düşündürüyor. Onun yerine
+   * burada durup ne gerektiğini söylüyoruz.
+   */
+  _identityFor(mailbox, { userAccessToken, allowServiceToken }) {
+    if (userAccessToken) {
+      return { ok: true, kind: 'user', accessToken: userAccessToken };
+    }
 
+    const isSystemMailbox = mailbox.kind === 'system' || mailbox.kind === 'catchall';
+    const serviceAllowed = allowServiceToken == null
+      ? (isSystemMailbox && this.config.trust.allowServiceIdentity)
+      : allowServiceToken;
+
+    if (serviceAllowed && this.serviceToken) {
+      return { ok: true, kind: 'service' };
+    }
+    if (!this.serviceToken && !userAccessToken) {
+      return { ok: false, code: 'no_token_source', reason: 'jeton kaynağı yok (ne kullanıcı jetonu ne servis jetonu)' };
+    }
+    return {
+      ok: false,
+      code: 'user_token_required',
+      reason: 'bu kutu için sertifika, kutu sahibinin kendi IdP oturumuyla istenmelidir',
+      hint: IDP_ERROR_HINTS.user_not_found,
+    };
+  }
+
+  /**
+   * Bütün etkin kutular için sertifika sağlar.
+   *
+   * Arka plan taraması KULLANICI kutularına dokunmaz: onlar için gereken
+   * jeton yalnızca kullanıcı giriş yaptığında var. Tarama, sistem kutularını
+   * (postmaster, dmarc) ve yenilenmesi gerekenleri kapsar.
+   */
+  async ensureAll({ force = false, includeUserMailboxes = false } = {}) {
+    const mailboxes = (await this.stores.mailboxes.listAll())
+      .filter((m) => m.status === 'active' && m.kind !== 'alias')
+      .filter((m) => includeUserMailboxes || m.kind === 'system' || m.kind === 'catchall');
+
+    const summary = {
+      total: mailboxes.length, issued: 0, renewed: 0, current: 0, failed: 0, skipped: 0,
+    };
     for (const mailbox of mailboxes) {
       const result = await this.ensureForMailbox(mailbox, { force });
       if (result.status === 'issued') summary.issued++;
@@ -191,11 +474,13 @@ class CertificateManager {
 
     if (summary.issued || summary.renewed || summary.failed) {
       this.logger.info({ ...summary, msg: 'S/MIME sertifika taraması tamamlandı' });
+    } else {
+      this.logger.debug({ ...summary, msg: 'S/MIME sertifika taraması: değişiklik yok' });
     }
     return summary;
   }
 
-  /** Yenileme zamanı gelenleri yeniler. */
+  /** Yenileme zamanı gelenleri yeniler (yalnızca servis kimliğiyle alınmış olanları). */
   async renewDue() {
     const due = await this.stores.certificates.listNeedingRenewal();
     const results = [];
@@ -205,6 +490,17 @@ class CertificateManager {
         ? await this.stores.mailboxes.getByRef(cert.mailboxRef)
         : await this.stores.mailboxes.getByAddress(cert.subjectAddress);
       if (!mailbox) continue;
+      // Kullanıcı jetonuyla alınmış bir sertifikayı arka planda yenileyemeyiz:
+      // jeton yok. Sahibine haber vermek doğru davranış.
+      if (cert.issuedVia === 'user-token' || cert.issuedVia === 'device-code') {
+        this.logger.warn({
+          address: cert.subjectAddress,
+          daysLeft: Math.floor((cert.notAfter - Date.now()) / 86400_000),
+          msg: 'kullanıcı sertifikasının süresi yaklaşıyor — sahibinin arayüzden yenilemesi gerekiyor',
+        });
+        results.push({ address: cert.subjectAddress, status: 'needs_user', code: 'user_token_required' });
+        continue;
+      }
       results.push({
         address: cert.subjectAddress,
         ...(await this.ensureForMailbox(mailbox, { force: true })),
@@ -286,7 +582,10 @@ class CertificateManager {
     const now = Date.now();
     return {
       sslAvailable: this.available,
+      trustBaseUrl: this.config.trust.baseUrl,
+      profile: this.config.trust.smimeProfile,
       serviceToken: this.serviceToken ? this.serviceToken.status() : { available: false },
+      serviceIdentityAllowed: !!this.config.trust.allowServiceIdentity,
       mailboxes: mailboxes.length,
       covered: covered.size,
       missing: mailboxes.filter((m) => !covered.has(m.address)).map((m) => m.address),
@@ -322,84 +621,4 @@ class CertificateManager {
   }
 }
 
-function httpJson(method, url, payload, headers, caPath = '') {
-  const target = new URL(url);
-  const transport = target.protocol === 'https:' ? https : http;
-  const options = {
-    method,
-    hostname: target.hostname,
-    port: target.port || (target.protocol === 'https:' ? 443 : 80),
-    path: `${target.pathname}${target.search}`,
-    headers: { ...headers, 'content-length': Buffer.byteLength(payload || '') },
-  };
-
-  // ========================================================
-  // 🟡 GİDEN İSTEĞİ LOGLAMA (SARI)
-  // ========================================================
-  console.log('\x1b[93m' + '================ CERT HTTP GİDEN İSTEK ==================' + '\x1b[0m');
-  console.log('\x1b[93m' + `METOT/URL : ${method} ${url}` + '\x1b[0m');
-  console.log('\x1b[93m' + `HEADERS   : ${JSON.stringify(options.headers, null, 2)}` + '\x1b[0m');
-
-  // CA SERTİFİKASI KONTROLÜ VE LOGU
-  if (caPath) {
-    try { 
-      const ca = require('node:fs').readFileSync(caPath); 
-      
-      // Node.js'in varsayılan global sertifikalarını SİLMEDEN bizimkini EKLİYORUZ:
-      options.ca = [...tls.rootCertificates, ca];
-      console.log('\x1b[92m' + `CA OKUNDU : ✅ Başarılı! Yol: ${caPath} (Boyut: ${options.ca.length} byte)` + '\x1b[0m');
-    } catch (caErr) { 
-      console.log('\x1b[91m' + `CA HATASI : ❌ Dosya okunamadı! Yol: ${caPath} | Sebep: ${caErr.message}` + '\x1b[0m');
-    }
-  } else {
-    console.log('\x1b[91m' + `CA UYARISI: ❌ caPath parametresi boş gönderildi!` + '\x1b[0m');
-  }
-
-  if (payload) {
-    // Çok uzun olabileceği için payload'ın sadece başını basıyoruz
-    console.log('\x1b[93m' + `PAYLOAD   :  ${payload}` + '\x1b[0m');
-  }
-  console.log('\x1b[93m' + '=========================================================' + '\x1b[0m');
-
-  return new Promise((resolve, reject) => {
-    const req = transport.request(options, (res) => {
-      const chunks = [];
-      res.on('data', (c) => chunks.push(c));
-      res.on('end', () => {
-        const raw = Buffer.concat(chunks).toString('utf8');
-
-        // ========================================================
-        // 🔵 GELEN YANITI LOGLAMA (MAVİ)
-        // ========================================================
-        console.log('\x1b[36m' + '================ CERT HTTP GELEN YANIT ==================' + '\x1b[0m');
-        console.log('\x1b[36m' + `STATUS : ${res.statusCode}` + '\x1b[0m');
-        console.log('\x1b[36m' + `BODY   : ${raw.slice(0, 300)}${raw.length > 300 ? '... (kısaltıldı)' : ''}` + '\x1b[0m');
-        console.log('\x1b[36m' + '=========================================================' + '\x1b[0m');
-
-        let parsed = null;
-        try { parsed = JSON.parse(raw); } catch { /* JSON değil */ }
-        if (res.statusCode >= 200 && res.statusCode < 300) {
-          resolve({ status: res.statusCode, json: parsed, raw });
-          return;
-        }
-        reject(new Error(`sertifika sunucusu HTTP ${res.statusCode}: ${(parsed && (parsed.error || parsed.message)) || raw.slice(0, 300)}`));
-      });
-    });
-    
-    req.setTimeout(30_000, () => { 
-      console.log('\x1b[91m' + `[CERT HTTP HATA] Zaman Aşımı (Timeout)!` + '\x1b[0m');
-      req.destroy(); 
-      reject(new Error('sertifika sunucusu zaman aşımı')); 
-    });
-    
-    req.on('error', (err) => {
-      console.log('\x1b[91m' + `[CERT HTTP HATA] Bağlantı Koptu: ${err.message}` + '\x1b[0m');
-      reject(new Error(`sertifika sunucusuna erişilemedi: ${err.message}`));
-    });
-    
-    if (payload) req.write(payload);
-    req.end();
-  });
-}
-
-module.exports = { CertificateManager };
+module.exports = { CertificateManager, CertificateError, IDP_ERROR_HINTS };

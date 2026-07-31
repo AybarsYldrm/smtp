@@ -7,6 +7,7 @@ const { URL } = require('node:url');
 
 const { b64url } = require('../util/encoding');
 const { verifyAsym } = require('../util/jwt');
+const log = require('../util/log');
 
 /**
  * Fitfak kimlik sağlayıcı (session.fitfak.net) istemcisi.
@@ -46,7 +47,7 @@ class IdpClient {
     this.clientSecret = clientSecret;
     this.redirectUri = redirectUri;
     this.scopes = scopes;
-    this.logger = logger;
+    this.logger = logger || log.child('idp');
     this.timeoutMs = timeoutMs;
     this.fetchImpl = fetchImpl;
     this.paths = {
@@ -90,17 +91,15 @@ class IdpClient {
       finalHeaders.authorization = `Bearer ${auth}`;
     }
 
-    // ========================================================
-    // 🟢 GİDEN İSTEĞİ LOGLAMA (YEŞİL)
-    // ========================================================
-    console.log('\x1b[92m' + '================ IDP GİDEN İSTEK ==================' + '\x1b[0m');
-    console.log('\x1b[92m' + `METOT/URL : ${method} ${url}` + '\x1b[0m');
-    console.log('\x1b[92m' + `HEADERS   : ${JSON.stringify(finalHeaders, null, 2)}` + '\x1b[0m');
-    if (payload) {
-      console.log('\x1b[92m' + `PAYLOAD   : ${payload}` + '\x1b[0m');
-    }
-    console.log('\x1b[92m' + '===================================================' + '\x1b[0m');
-    // ========================================================
+    // İzleme kaydı seviyeye BAĞLI ve maskeli. Buradaki gövde bir jeton
+    // takası olabiliyor; `client_secret`/`code` gibi alanlar düz metin
+    // yazılırsa kaydı okuyan herkes oturum açabilir hâle gelir.
+    this.logger.http('→ idp', {
+      method,
+      url,
+      headers: log.safeHeaders(finalHeaders),
+      body: payload ? log.snippet(redactFormPayload(payload), 400) : undefined,
+    });
 
     if (this.fetchImpl) {
       return this.fetchImpl({ method, url, headers: finalHeaders, body: payload, json });
@@ -119,15 +118,14 @@ class IdpClient {
         res.on('data', (c) => chunks.push(c));
         res.on('end', () => {
           const raw = Buffer.concat(chunks).toString('utf8');
-          
-          // ========================================================
-          // 🔵 GELEN YANITI LOGLAMA (MAVİ)
-          // ========================================================
-          console.log('\x1b[36m' + '================ IDP GELEN YANIT ==================' + '\x1b[0m');
-          console.log('\x1b[36m' + `STATUS : ${res.statusCode}` + '\x1b[0m');
-          console.log('\x1b[36m' + `BODY   : ${raw}` + '\x1b[0m');
-          console.log('\x1b[36m' + '===================================================' + '\x1b[0m');
-          // ========================================================
+
+          this.logger.http('← idp', {
+            method,
+            url,
+            status: res.statusCode,
+            contentType: res.headers['content-type'] || '',
+            body: log.snippet(redactTokenResponse(raw), 400),
+          });
 
           let parsed = null;
           if (json && raw) {
@@ -428,6 +426,52 @@ class IdpClient {
       raw: c,
     };
   }
+}
+
+/**
+ * Form gövdesindeki sırları maskeler.
+ *
+ * `client_secret`, `code`, `code_verifier`, `refresh_token`, `device_code` ve
+ * `token`: hepsi tek başına oturum açmaya ya da jeton almaya yeter. Kayda
+ * yazılan sürümde yalnızca ALANIN VAR OLDUĞU görünür — hata ayıklarken
+ * sorulan soru zaten "gönderdik mi", "değeri neydi" değil.
+ */
+const SENSITIVE_FORM_KEYS = new Set([
+  'client_secret', 'code', 'code_verifier', 'refresh_token', 'device_code',
+  'token', 'assertion', 'password',
+]);
+
+function redactFormPayload(payload) {
+  const text = String(payload || '');
+  if (!text.includes('=')) return text;
+  if (text.trim().startsWith('{')) {
+    try {
+      const parsed = JSON.parse(text);
+      for (const key of Object.keys(parsed)) {
+        if (SENSITIVE_FORM_KEYS.has(key)) parsed[key] = log.maskSecret(parsed[key]);
+      }
+      return JSON.stringify(parsed);
+    } catch { return text; }
+  }
+  const params = new URLSearchParams(text);
+  const out = new URLSearchParams();
+  for (const [key, value] of params) {
+    out.set(key, SENSITIVE_FORM_KEYS.has(key) ? log.maskSecret(value) : value);
+  }
+  return out.toString();
+}
+
+/** Jeton yanıtındaki access/refresh/id jetonlarını maskeler. */
+function redactTokenResponse(raw) {
+  const text = String(raw || '');
+  if (!text.trim().startsWith('{')) return text;
+  try {
+    const parsed = JSON.parse(text);
+    for (const key of ['access_token', 'refresh_token', 'id_token']) {
+      if (parsed[key]) parsed[key] = log.maskSecret(parsed[key]);
+    }
+    return JSON.stringify(parsed);
+  } catch { return text; }
 }
 
 function normalizeTokenResponse(json) {

@@ -14,7 +14,17 @@ const { HttpError } = require('../router');
 function registerAuthRoutes(router, deps) {
   const { config, logger, sessions, stores } = deps;
 
-  router.get('/login', async (ctx) => {
+  /**
+   * Giriş.
+   *
+   * İki yol da kayıtlı: `/giris` arayüzün kullandığı ad, `/login` ise
+   * belgelerde ve hata sayfalarında geçen ad. Önceki sürümde YALNIZCA
+   * `/login` kayıtlıydı; arayüzdeki "Fitfak Kimlik ile giriş yap" düğmesi
+   * `/giris`e gidiyordu ve o yol, tek sayfa uygulamasının "bulunamadı"
+   * yakalayıcısına düşüp aynı sayfayı geri veriyordu. Yani düğme hiçbir şey
+   * yapmıyor gibi görünüyordu — istek başarılı, sayfa aynı.
+   */
+  const beginLogin = async (ctx) => {
     const sid = ctx.cookies()[config.http.sessionCookieName];
     if (sid) {
       const existing = await sessions.authenticate({ sid, ip: ctx.ip });
@@ -23,11 +33,13 @@ function registerAuthRoutes(router, deps) {
     const begin = await sessions.beginLogin({
       ip: ctx.ip,
       userAgent: ctx.header('user-agent') || '',
-      returnTo: ctx.query.get('donus') || '/',
-      loginHint: ctx.query.get('eposta') || null,
+      returnTo: ctx.query.get('donus') || ctx.query.get('return_to') || '/',
+      loginHint: ctx.query.get('eposta') || ctx.query.get('login_hint') || null,
     });
     ctx.redirect(begin.url);
-  });
+  };
+  router.get('/login', beginLogin);
+  router.get('/giris', beginLogin);
 
   router.get(config.idp.redirectPath, async (ctx) => {
     const error = ctx.query.get('error');
@@ -50,15 +62,34 @@ function registerAuthRoutes(router, deps) {
       const result = await sessions.completeLogin({
         code, state, ip: ctx.ip, userAgent: ctx.header('user-agent') || '',
       });
+
+      // Kapsam yükseltmesi: oturum zaten var, yeni çerez yazılmaz. Kullanıcı
+      // yarıda bıraktığı yere döner.
+      if (result.scopeUpgrade) {
+        logger.info({ scope: result.scope, msg: 'kapsam yükseltme tamamlandı' });
+        ctx.redirect(safePath(result.returnTo) || '/');
+        return;
+      }
+
       ctx.setCookie(config.http.sessionCookieName, result.sid, {
         maxAge: Math.floor((result.expiresAt - Date.now()) / 1000),
         httpOnly: true,
         sameSite: 'Lax',
       });
       if (!result.mailboxes.length) {
-        // Erişilebilir kutu yok: bu bir hata değil, bir yetki durumu. Ne
-        // yapılması gerektiğini söylemek, "boş kutu" göstermekten iyi.
-        ctx.html(200, noMailboxPage(result.profile.email, config));
+        // Erişilebilir kutu yok: bu bir hata değil, bir yetki durumu.
+        //
+        // Oturum yine de AÇILIYOR ve çerez yazılıyor. Önceki sürümde de
+        // öyleydi ama kullanıcı bu sayfada kalıyordu; oysa arayüz aynı
+        // durumu kendi ekranında gösterebiliyor ve oradan çıkış yapılabiliyor.
+        // Burada kalmanın tek anlamı, tarayıcıya JavaScript'siz de bir yanıt
+        // verebilmek.
+        logger.info({
+          email: result.profile.email,
+          reason: result.noMailbox && result.noMailbox.code,
+          msg: 'giriş başarılı ama erişilebilir posta kutusu yok',
+        });
+        ctx.html(200, noMailboxPage(result.noMailbox, config));
         return;
       }
       ctx.redirect(safePath(result.returnTo) || '/');
@@ -68,13 +99,43 @@ function registerAuthRoutes(router, deps) {
     }
   });
 
-  router.get('/logout', async (ctx) => {
+  const doLogout = async (ctx) => {
     const sid = ctx.cookies()[config.http.sessionCookieName];
     if (sid) {
       await sessions.logout({ sid, revokeIdpSessions: ctx.query.get('hepsi') === '1' }).catch(() => {});
     }
     ctx.clearCookie(config.http.sessionCookieName);
     ctx.redirect('/');
+  };
+  router.get('/logout', doLogout);
+  router.get('/cikis', doLogout);
+
+  /**
+   * Kapsam yükseltme başlatıcı.
+   *
+   * Sertifika istemek `cert:issue` kapsamı gerektiriyor ve o kapsam ilk
+   * girişte istenmemiş olabilir (ya da kullanıcı onaylamamış olabilir).
+   * Kullanıcıyı giriş ekranına atmak yerine yalnızca EKSİK olan için onay
+   * istiyoruz; dönüşte aynı oturum devam eder.
+   */
+  router.get('/yetki-yukselt', async (ctx) => {
+    const sid = ctx.cookies()[config.http.sessionCookieName];
+    const session = sid ? await sessions.authenticate({ sid, ip: ctx.ip }) : null;
+    if (!session) { ctx.redirect(`/giris?donus=${encodeURIComponent(ctx.query.get('donus') || '/')}`); return; }
+
+    const scope = String(ctx.query.get('kapsam') || config.trust.issueScope);
+    const allowed = new Set([...config.idp.scopes, config.trust.issueScope]);
+    if (!allowed.has(scope)) throw new HttpError(400, 'Bilinmeyen kapsam');
+
+    const begin = await sessions.beginScopeUpgrade({
+      session,
+      scope,
+      returnTo: ctx.query.get('donus') || '/',
+      ip: ctx.ip,
+      userAgent: ctx.header('user-agent') || '',
+    });
+    logger.info({ email: session.idpEmail, scope, msg: 'kapsam yükseltme başlatıldı' });
+    ctx.redirect(begin.url);
   });
 
   router.post('/logout', async (ctx) => {
@@ -135,21 +196,19 @@ function errorPage(title, detail) {
   return page(title, `
     <h1>${escapeHtml(title)}</h1>
     <p>${escapeHtml(detail)}</p>
-    <p><a class="btn" href="/login">Tekrar dene</a></p>
+    <p><a class="btn" href="/giris">Tekrar dene</a></p>
   `);
 }
 
-function noMailboxPage(email, config) {
+function noMailboxPage(reason, config) {
+  const info = reason || { message: 'Bu kimliğe tanımlı bir posta kutusu bulunmuyor.', action: '' };
   return page('Posta kutusu yok', `
     <h1>Hesabınıza bağlı posta kutusu yok</h1>
-    <p><strong>${escapeHtml(email)}</strong> ile giriş yaptınız, ancak bu kimliğe
-       tanımlı bir posta kutusu bulunmuyor.</p>
-    <p>Kendi alan adımızdaki bir adresle giriş yaptıysanız kutunuz henüz
-       oluşturulmamış olabilir. Harici bir adresle (ör. Gmail) giriş
-       yaptıysanız, bir yöneticinin bu adresi bir posta kutusuna
-       <em>bağlaması</em> gerekir.</p>
-    <p>Yönetici ile iletişim: <a href="mailto:postmaster@${escapeHtml(config.primaryDomain)}">postmaster@${escapeHtml(config.primaryDomain)}</a></p>
-    <p><a class="btn" href="/logout">Çıkış yap</a></p>
+    <p>${escapeHtml(info.message)}</p>
+    ${info.action ? `<p>${escapeHtml(info.action)}</p>` : ''}
+    <p>Yönetici ile iletişim:
+      <a href="mailto:network@${escapeHtml(config.primaryDomain)}">network@${escapeHtml(config.primaryDomain)}</a></p>
+    <p><a class="btn" href="/cikis">Çıkış yap</a></p>
   `);
 }
 
