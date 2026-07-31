@@ -390,6 +390,49 @@ runner.test('PKCS#12: içe alım sertifikayı kutuya ve anahtara bağlar', async
   assertEqual(wrongKey.code, 'PFX_KEY_MISMATCH', 'hata kodu');
 });
 
+runner.test('PKCS#12: kasadaki çift dışa aktarılıp geri alınabilir', async () => {
+  if (!OPENSSL) return;
+  const { PKCS12 } = require('../src/certs/pkcs12');
+  const { matchCertificateToMailbox } = require('../src/http/api/webmail');
+
+  const address = 'network@fitfak.net';
+  const mailbox = (await ctx.stores.mailboxes.ensure(address, { displayName: 'Ağ' })).mailbox;
+  const { privateKey } = crypto.generateKeyPairSync('rsa', { modulusLength: 2048 });
+  const keyPem = privateKey.export({ type: 'pkcs8', format: 'pem' });
+  const certPem = selfSignedCert(keyPem, address);
+
+  await ctx.stores.certificates.store({
+    usage: 'smime', subjectAddress: address, mailboxRef: mailbox.ref,
+    certPem, privateKeyPem: keyPem, issuedVia: 'test',
+  });
+
+  // Dışa aktarma yolu: imzalama çifti kasadan okunur ve .pfx'e konur.
+  const pair = await ctx.stores.certificates.getSigningPair('smime', address);
+  assert(pair && pair.privateKeyPem, 'kasadan imzalama çifti okunmalı');
+  const pfx = new PKCS12('disa-aktarim-parolasi').build(pair.certPem, pair.privateKeyPem, {
+    friendlyName: `${address} (S/MIME)`,
+  });
+
+  // İçe aktarma yolu: aynı dosya geri alındığında kutuya ve anahtara bağlanır.
+  const parsed = new PKCS12('disa-aktarim-parolasi').parse(pfx);
+  const verdict = matchCertificateToMailbox(parsed, address);
+  assert(verdict.ok, `içe alım eşleşmeliydi: ${verdict.reason}`);
+
+  const stored = await ctx.stores.certificates.store({
+    usage: 'smime', subjectAddress: address, mailboxRef: mailbox.ref,
+    certPem: verdict.certPem, chainPem: verdict.chainPem,
+    privateKeyPem: verdict.privateKeyPem, issuedVia: 'pfx-import',
+  });
+  assertEqual(stored.version, 2, 'yeni sürüm yazılmalı (eskisi arşivlenir)');
+
+  const after = await ctx.stores.certificates.getSigningPair('smime', address);
+  assertEqual(
+    crypto.createPrivateKey(after.privateKeyPem).export({ type: 'pkcs8', format: 'der' }).toString('hex'),
+    crypto.createPrivateKey(keyPem).export({ type: 'pkcs8', format: 'der' }).toString('hex'),
+    'gidip gelen anahtar aynı olmalı',
+  );
+});
+
 /** Testler için kendinden imzalı sertifika (openssl varsa ondan). */
 function selfSignedCert(keyPem, email = 'test@fitfak.net') {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'fitmail-cert-'));

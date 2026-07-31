@@ -714,8 +714,10 @@ function renderCertificate(certificate) {
       <div class="btn-row">
         <button class="btn btn-sm" id="s-cert-renew">Yenile</button>
         <a class="btn btn-sm" download="smime.crt"
-           href="data:application/x-pem-file;base64,${btoa(unescape(encodeURIComponent(certificate.certPem || '')))}">İndir</a>
-      </div>`;
+           href="data:application/x-pem-file;base64,${btoa(unescape(encodeURIComponent(certificate.certPem || '')))}">Sertifikayı indir</a>
+        <button class="btn btn-sm" id="s-cert-export">.pfx olarak dışa aktar</button>
+      </div>
+      ${pfxPanel()}`;
   }
   return `
     <p class="muted">Bu adres için henüz sertifika yok. Sertifika olmadan giden postayı
@@ -724,7 +726,46 @@ function renderCertificate(certificate) {
       panelinde görünür. Bunun için oturumunuzun sertifika izni taşıması gerekiyor;
       taşımıyorsa bir onay ekranına yönlendirilirsiniz.</p>
     <button class="btn btn-sm btn-primary" id="s-cert-issue">Sertifika iste</button>
-    <div id="cert-error"></div>`;
+    <div id="cert-error"></div>
+    ${pfxPanel()}`;
+}
+
+/**
+ * .pfx (PKCS#12) alışverişi.
+ *
+ * Dışa aktarma, ÖZEL ANAHTARIN sunucudan çıktığı tek yol; bu yüzden parola
+ * zorunlu ve uyarı görünür yerde. İçe aktarma ise başka bir yerde üretilmiş
+ * bir anahtarı sisteme tanıtmanın taşınabilir yolu — Thunderbird, Outlook ve
+ * Apple Mail hep bu biçimi kullanıyor.
+ */
+function pfxPanel() {
+  return `
+    <details class="pfx-panel">
+      <summary>Anahtar dosyası (.pfx) alışverişi</summary>
+      <p class="hint">.pfx dosyası sertifikayı VE özel anahtarı birlikte taşır;
+        Thunderbird, Outlook, Apple Mail ve telefon profilleri bu biçimi okur.
+        Dosya parolayla şifrelenir — parolayı kaybederseniz dosya açılamaz.</p>
+
+      <label class="field">
+        <span>Dosya parolası (en az 8 karakter)</span>
+        <input type="password" id="s-pfx-password" autocomplete="new-password" minlength="8">
+      </label>
+
+      <div class="btn-row">
+        <button class="btn btn-sm" id="s-pfx-export">Dışa aktar (.pfx indir)</button>
+      </div>
+
+      <label class="field">
+        <span>İçe aktarılacak .pfx dosyası</span>
+        <input type="file" id="s-pfx-file" accept=".pfx,.p12,application/x-pkcs12">
+      </label>
+      <div class="btn-row">
+        <button class="btn btn-sm" id="s-pfx-import">İçe aktar</button>
+      </div>
+      <p class="tiny muted">İçe aktarılan sertifikanın bu adresi içermesi ve özel
+        anahtarın ona ait olması gerekir; ikisi de doğrulanır.</p>
+      <div id="pfx-note"></div>
+    </details>`;
 }
 
 function bindSettings() {
@@ -748,6 +789,22 @@ function bindSettings() {
     if (!button) continue;
     button.addEventListener('click', () => requestCertificate(button, id === 's-cert-renew'));
   }
+
+  const certExport = el('s-cert-export');
+  if (certExport) {
+    certExport.addEventListener('click', () => {
+      const panel = document.querySelector('.pfx-panel');
+      if (panel) { panel.open = true; panel.scrollIntoView({ block: 'nearest' }); }
+      const field = el('s-pfx-password');
+      if (field) field.focus();
+    });
+  }
+
+  const pfxExport = el('s-pfx-export');
+  if (pfxExport) pfxExport.addEventListener('click', () => exportPfx(pfxExport));
+
+  const pfxImport = el('s-pfx-import');
+  if (pfxImport) pfxImport.addEventListener('click', () => importPfx(pfxImport));
 
   const pushToggle = el('s-push-toggle');
   if (pushToggle) pushToggle.addEventListener('click', togglePush);
@@ -834,6 +891,102 @@ async function requestCertificate(button, force) {
     button.disabled = false;
     button.textContent = original;
   }
+}
+
+/**
+ * .pfx indirir.
+ *
+ * `api()` KULLANILMIYOR: yanıt JSON değil ikili bir dosya ve onu metne
+ * çevirmek baytları bozar. İndirme, bellekteki bir Blob üzerinden yapılıyor
+ * ve nesne adresi hemen serbest bırakılıyor — bırakılmazsa özel anahtar
+ * içeren blob, sekme kapanana kadar bellekte kalır.
+ */
+async function exportPfx(button) {
+  const password = (el('s-pfx-password') || {}).value || '';
+  if (password.length < 8) { renderPfxNote('Dosya parolası en az 8 karakter olmalı.', 'bad'); return; }
+
+  const original = button.textContent;
+  button.disabled = true;
+  button.textContent = 'hazırlanıyor…';
+  try {
+    const res = await fetch(
+      `/api/v1/mailboxes/${encodeURIComponent(state.mailbox.ref)}/certificate/export`,
+      {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'content-type': 'application/json', 'x-csrf-token': state.me.csrfToken },
+        body: JSON.stringify({ password }),
+      },
+    );
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      throw new Error(data.error || `HTTP ${res.status}`);
+    }
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `${state.mailbox.address.replace('@', '-at-')}.pfx`;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
+    renderPfxNote('Dosya indirildi. Parolasını güvenli bir yerde saklayın — '
+      + 'dosya o parola olmadan açılamaz.', 'ok');
+    el('s-pfx-password').value = '';
+  } catch (err) {
+    renderPfxNote(err.message, 'bad');
+  } finally {
+    button.disabled = false;
+    button.textContent = original;
+  }
+}
+
+/** Seçilen .pfx dosyasını sunucuya gönderir. */
+async function importPfx(button) {
+  const input = el('s-pfx-file');
+  const file = input && input.files && input.files[0];
+  if (!file) { renderPfxNote('Önce bir .pfx dosyası seçin.', 'bad'); return; }
+
+  const original = button.textContent;
+  button.disabled = true;
+  button.textContent = 'aktarılıyor…';
+  try {
+    const form = new FormData();
+    form.set('file', file, file.name);
+    form.set('password', (el('s-pfx-password') || {}).value || '');
+    const res = await fetch(
+      `/api/v1/mailboxes/${encodeURIComponent(state.mailbox.ref)}/certificate/import`,
+      {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'x-csrf-token': state.me.csrfToken },
+        body: form,
+      },
+    );
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+
+    renderPfxNote(
+      `Sertifika içe aktarıldı (sürüm ${data.version}${data.chainLength ? `, ${data.chainLength} ara sertifika` : ''}).`,
+      'ok',
+    );
+    state.me = await api('/api/v1/me');
+    state.mailbox = state.me.mailboxes.find((m) => m.ref === state.mailbox.ref) || state.mailbox;
+    input.value = '';
+    el('s-pfx-password').value = '';
+  } catch (err) {
+    renderPfxNote(err.message, 'bad');
+  } finally {
+    button.disabled = false;
+    button.textContent = original;
+  }
+}
+
+function renderPfxNote(message, kind) {
+  const slot = el('pfx-note');
+  if (!slot) return;
+  slot.innerHTML = `<div class="note note-${kind}">${esc(message)}</div>`;
 }
 
 function renderCertNote(message, kind, actionsHtml) {
