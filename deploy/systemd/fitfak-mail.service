@@ -1,0 +1,64 @@
+[Unit]
+Description=Fitfak posta sunucusu (SMTP + webmail)
+Documentation=https://github.com/AybarsYldrm/smtp
+After=network-online.target fitfak-mail-loopback.service
+Wants=network-online.target
+Requires=fitfak-mail-loopback.service
+
+[Service]
+Type=simple
+User=fitfak-mail
+Group=fitfak-mail
+WorkingDirectory=/opt/fitfak-mail
+ExecStart=/usr/bin/node /opt/fitfak-mail/bin/fitfak-mail.js
+
+# Sırlar ortamdan gelir; dosya 0600 ve fitfak-mail kullanıcısına ait olmalı.
+EnvironmentFile=/etc/fitfak/mail.env
+
+# 25/465/587 ayrıcalıklı portlar. Sunucuyu root olarak çalıştırmak yerine
+# yalnızca bu yeteneği veriyoruz: bir açık, tüm makineye erişim demesin.
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+
+# Yazılabilir tek yer veri dizini.
+StateDirectory=fitfak-mail
+ReadWritePaths=/var/lib/fitfak-mail
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @obsolete
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+# Kuyruk işçileri ve çok sayıda giden bağlantı için.
+LimitNOFILE=65535
+
+Restart=on-failure
+RestartSec=5s
+# Açılışta yapılandırma hatası varsa (eksik sır gibi) sonsuz döngüye girmesin.
+StartLimitBurst=5
+StartLimitIntervalSec=120
+
+# SIGTERM'de açık SMTP oturumları ve kuyruk işi düzgün kapansın.
+KillSignal=SIGTERM
+TimeoutStopSec=45
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=fitfak-mail
+
+[Install]
+WantedBy=multi-user.target

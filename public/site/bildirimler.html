@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="tr" data-ff-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#12142b">
+<title>Bildirimler — Aybars Yıldırım</title>
+<link rel="icon" href="/favicon.ico">
+<link rel="stylesheet" href="https://session.fitfak.net/static/fitfak-ui.css">
+<link rel="stylesheet" href="/static/fitfak-ui.css">
+<link rel="stylesheet" href="/static/site.css">
+</head>
+<body>
+
+<main class="st-main">
+  <div class="st-panel-head">
+    <div>
+      <h1 style="margin-bottom:4px">Bildirimler</h1>
+      <p class="ff-muted ff-small" style="margin:0">
+        Instagram bağlantısı üzerinden gelen ziyaretler. Oturum: {{EMAIL}}
+      </p>
+    </div>
+    <div class="ff-spacer"></div>
+    <div class="st-stat">
+      <span class="st-stat-value">{{TOTAL}}</span>
+      <span class="st-stat-label">son 30 gün</span>
+    </div>
+  </div>
+
+  <div class="ff-row-wrap" style="margin-bottom:20px">
+    <button class="ff-btn ff-btn-primary" id="push-btn">Bildirimleri aç</button>
+    <a class="ff-btn" href="/">← Siteye dön</a>
+    <a class="ff-btn ff-btn-ghost" href="/cikis">Çıkış</a>
+    <span class="ff-tiny ff-dim" id="push-status"></span>
+  </div>
+
+  <div class="ff-table-wrap">
+    <table class="ff-table">
+      <thead>
+        <tr><th>Tarih</th><th>IP</th><th>Cihaz</th><th>Sağlayıcı / Konum</th></tr>
+      </thead>
+      <tbody>{{ROWS}}</tbody>
+    </table>
+  </div>
+</main>
+
+<script>
+const CSRF = "{{CSRF}}";
+
+function urlBase64ToUint8Array(base64) {
+  const padding = '='.repeat((4 - (base64.length % 4)) % 4);
+  const normalized = (base64 + padding).replace(/-/g, '+').replace(/_/g, '/');
+  const raw = atob(normalized);
+  const out = new Uint8Array(raw.length);
+  for (let i = 0; i < raw.length; i++) out[i] = raw.charCodeAt(i);
+  return out;
+}
+
+async function refreshState() {
+  const status = document.getElementById('push-status');
+  const button = document.getElementById('push-btn');
+  if (!('serviceWorker' in navigator) || !('PushManager' in window)) {
+    button.disabled = true;
+    status.textContent = 'Tarayıcınız bildirimleri desteklemiyor.';
+    return null;
+  }
+  const registration = await navigator.serviceWorker.register('/sw.js');
+  await navigator.serviceWorker.ready;
+  const subscription = await registration.pushManager.getSubscription();
+  button.textContent = subscription ? 'Bildirimleri kapat' : 'Bildirimleri aç';
+  status.textContent = subscription ? 'Bu cihazda açık.' : '';
+  return { registration, subscription };
+}
+
+document.getElementById('push-btn').addEventListener('click', async () => {
+  const button = document.getElementById('push-btn');
+  const status = document.getElementById('push-status');
+  button.disabled = true;
+  try {
+    const current = await refreshState();
+    if (!current) return;
+
+    if (current.subscription) {
+      await fetch('/api/v1/push/unsubscribe', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-csrf-token': CSRF },
+        credentials: 'same-origin',
+        body: JSON.stringify({ endpoint: current.subscription.endpoint }),
+      });
+      await current.subscription.unsubscribe();
+    } else {
+      const permission = await Notification.requestPermission();
+      if (permission !== 'granted') { status.textContent = 'İzin verilmedi.'; return; }
+      const keyRes = await fetch('/api/v1/push/public-key', { credentials: 'same-origin' });
+      const { publicKey } = await keyRes.json();
+      const subscription = await current.registration.pushManager.subscribe({
+        userVisibleOnly: true,
+        applicationServerKey: urlBase64ToUint8Array(publicKey),
+      });
+      const res = await fetch('/api/v1/push/subscribe', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-csrf-token': CSRF },
+        credentials: 'same-origin',
+        body: JSON.stringify({ subscription: subscription.toJSON(), topics: ['site'] }),
+      });
+      if (!res.ok) throw new Error('Sunucu aboneliği kabul etmedi');
+    }
+    await refreshState();
+  } catch (err) {
+    status.textContent = 'Hata: ' + err.message;
+  } finally {
+    button.disabled = false;
+  }
+});
+
+refreshState();
+</script>
+</body>
+</html>

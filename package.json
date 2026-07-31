@@ -1,0 +1,59 @@
+{
+  "name": "@fitfak/smtp",
+  "version": "2.1.0",
+  "description": "Posta sunucusu ve SMTP istemcisi — SMTP (25/465/587), DKIM, SPF, DMARC, S/MIME, webmail, gerçek zamanlı bildirim; @fitfak/database üzerinde şifreli saklama.",
+  "license": "MIT",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./src/smtp/client.js",
+    "./dkim": "./src/mail/dkim.js",
+    "./spf": "./src/mail/spf.js",
+    "./dmarc": "./src/mail/dmarc.js",
+    "./mime": "./src/mail/mime-parser.js",
+    "./config": "./src/define-config.js",
+    "./package.json": "./package.json"
+  },
+  "keywords": [
+    "smtp", "mail", "email", "dkim", "spf", "dmarc", "smime", "mx", "webmail", "mta"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "bin": {
+    "fitfak-mail": "bin/fitfak-mail.js",
+    "fitfak-mail-cert": "bin/fitfak-mail-cert.js",
+    "fitfak-mail-verify": "bin/fitfak-mail-verify.js"
+  },
+  "scripts": {
+    "start": "node bin/fitfak-mail.js",
+    "check": "node bin/fitfak-mail.js --check",
+    "link:deps": "node scripts/link-deps.js",
+    "test": "node test/run-all.js",
+    "test:crypto": "node test/run-all.js crypto",
+    "test:mail": "node test/run-all.js mime smtp-e2e",
+    "test:db": "node test/run-all.js storage",
+    "test:http": "node test/run-all.js http-api auth-identity"
+  },
+  "peerDependencies": {
+    "@fitfak/database": "*",
+    "@fitfak/ssl": "*"
+  },
+  "peerDependenciesMeta": {
+    "@fitfak/database": {
+      "optional": false
+    },
+    "@fitfak/ssl": {
+      "optional": false
+    }
+  },
+  "dependencies": {},
+  "files": [
+    "index.js",
+    "bin",
+    "src",
+    "public",
+    "deploy",
+    "README.md"
+  ]
+}

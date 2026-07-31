@@ -1,0 +1,644 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Aybars Yıldırım</title>
+  <link rel="icon" href="/favicon.ico" type="image/x-icon" />
+
+  <style>
+    :root{
+      --bg:#0f0f10;
+      --card:#17181a;
+      --border:#2a2b2f;
+      --text:#f4f4f5;
+      --muted:#a1a1aa;
+
+      --soft:#f4f1ec;        /* beyaz kart */
+      --softText:#171717;
+
+      --radius:18px;
+
+      --shadow: 0 16px 40px rgba(0,0,0,.35);
+      --shadowSoft: 0 12px 30px rgba(0,0,0,.22);
+    }
+
+    *{box-sizing:border-box}
+    html,body{height:100%}
+
+    body{
+      margin:0;
+      font-family:system-ui,-apple-system,Segoe UI,Roboto;
+      background:
+        radial-gradient(1200px 600px at 50% -100px, rgba(255,255,255,.06), transparent 60%),
+        var(--bg);
+      color:var(--text);
+      line-height:1.6;
+    }
+
+    header{
+      padding:2.6rem 1.4rem;
+      text-align:center;
+      border-bottom:1px solid var(--border);
+      background: linear-gradient(180deg, rgba(255,255,255,.04), transparent);
+    }
+    header h1{margin:0;font-size:2.1rem;font-weight:650;letter-spacing:.2px}
+
+    .layout{
+      max-width:1180px;
+      margin:2.1rem auto;
+      padding:0 1.25rem;
+      display:grid;
+      grid-template-columns: 1fr 300px;
+      gap:2rem;
+      align-items:start;
+    }
+
+    /* Kartlar arası boşluk tek yerden */
+    .stack{
+      display:flex;
+      flex-direction:column;
+      gap:1.35rem;
+    }
+
+    section{
+      background:var(--card);
+      border:1px solid var(--border);
+      border-radius:var(--radius);
+      padding:1.55rem;
+      box-shadow: var(--shadowSoft);
+      overflow:hidden;
+    }
+
+    section h2{
+      margin:0 0 .9rem 0;
+      font-size:1.15rem;
+      border-bottom:1px solid var(--border);
+      padding-bottom:.45rem;
+      letter-spacing:.2px;
+    }
+
+    .highlight{
+      background:var(--soft);
+      color:var(--softText);
+      border:0;
+      box-shadow: var(--shadow);
+    }
+    .highlight h2{
+      border-bottom:1px solid rgba(0,0,0,.12);
+    }
+    .highlight p{margin:.6rem 0 0 0}
+
+    /* ===== Button (tek ve temiz) ===== */
+    .btn{
+      display:inline-flex;
+      align-items:center;
+      justify-content:center;
+      gap:.6rem;
+      padding:.78rem 1.05rem;
+      border-radius:12px;
+      border:1px solid #3a3b42;
+      background: rgba(255,255,255,.02);
+      color:var(--text);
+      text-decoration:none;
+      font-weight:650;
+      letter-spacing:.15px;
+      transition: transform .15s ease, border-color .15s ease, background .15s ease, filter .15s ease;
+      user-select:none;
+    }
+    .btn:hover{
+      border-color:#585a66;
+      background: rgba(255,255,255,.04);
+      transform: translateY(-1px);
+    }
+
+    /* ===== Spotify Hero ===== */
+    .spotify-hero{
+      border-radius: calc(var(--radius) - 2px);
+      overflow:hidden;
+      border:1px solid rgba(255,255,255,.06);
+      box-shadow: var(--shadow);
+      background: #0b0b0c;
+    }
+    .sp-spotify-title{
+      font-family:"SpotifyMix", "Inter", system-ui, sans-serif;
+      font-weight:800;
+      letter-spacing:-0.02em;
+      font-size:2.35rem;
+
+      /* kritik düzeltme */
+      line-height:1.12;          /* 1.05 yerine */
+      padding-bottom:.06em;      /* kuyruk için min alan */
+      display:inline-block;      /* padding etkili olsun */
+      overflow:visible;          /* kırpma olmasın */
+
+      color:#ffffff;
+      text-rendering:optimizeLegibility;
+      -webkit-font-smoothing:antialiased;
+    }
+    .sp-banner{ overflow: visible; }
+
+
+    .sp-profilelink{
+      text-decoration:none;
+      color:inherit;
+      display:block;
+      transition: transform .15s ease, filter .15s ease;
+    }
+    .sp-profilelink:hover{
+      transform: translateY(-1px);
+      filter: brightness(1.03);
+    }
+
+    .sp-banner{
+      position:relative;
+      padding:1.25rem 1.2rem 1.05rem 1.2rem;
+      background:
+        radial-gradient(900px 260px at 12% 45%, rgba(255,255,255,.12), transparent 60%),
+        radial-gradient(700px 260px at 85% 20%, rgba(0,0,0,.22), transparent 60%),
+        linear-gradient(135deg, #0d3a7a 0%, #0a2f6f 35%, #071b3d 100%);
+    }
+
+    .sp-toprow{
+      display:flex;
+      align-items:center;
+      gap:1.05rem;
+      min-height:92px;
+    }
+
+    .sp-avatar{
+      width:92px;
+      height:92px;
+      border-radius:50%;
+      overflow:hidden;
+      border:2px solid rgba(255,255,255,.12);
+      flex:0 0 auto;
+      background: rgba(0,0,0,.25);
+    }
+    .sp-avatar img{
+      width:100%;
+      height:100%;
+      object-fit:cover;
+      display:block;
+    }
+
+    .sp-text{min-width:0;flex:1 1 auto}
+
+    .sp-label{
+      font-size:.85rem;
+      color: rgba(255,255,255,.82);
+      letter-spacing:.2px;
+    }
+
+    .sp-name{
+      margin:.15rem 0 .25rem 0;
+      font-size:2.25rem;
+      line-height:1.05;
+      font-weight:820;
+      letter-spacing:.2px;
+      color:#fff;
+      white-space:nowrap;
+      overflow:hidden;
+      text-overflow:ellipsis;
+    }
+
+    .sp-sub{
+      font-size:.92rem;
+      color: rgba(255,255,255,.78);
+      white-space:nowrap;
+      overflow:hidden;
+      text-overflow:ellipsis;
+    }
+.btn-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;          /* butonlar arası boşluk */
+  flex-wrap: wrap;    /* dar ekranda alta düşsün */
+}
+
+    /* Player: Spotify iframe arkaplanını silemeyiz.
+       Ama “katıştırmak” için zemin + overlay + padding kullanıyoruz. */
+    .sp-player{
+      position:relative;
+      padding:14px;
+      border-top: 1px solid rgba(255,255,255,.08);
+      background:
+        radial-gradient(700px 220px at 15% 25%, rgba(13,58,122,.35), transparent 60%),
+        radial-gradient(700px 220px at 85% 60%, rgba(7,27,61,.55), transparent 62%),
+        #0b0b0c;
+    }
+
+    /* Hafif “glass” katmanı */
+    .sp-player::before{
+      content:"";
+      position:absolute;
+      inset:0;
+      pointer-events:none;
+      background: linear-gradient(180deg, rgba(255,255,255,.06), transparent 40%, rgba(0,0,0,.18));
+      opacity:.55;
+    }
+
+    .sp-iframewrap{
+      position:relative;
+      border-radius:14px;
+      overflow:hidden;
+      border:1px solid rgba(255,255,255,.10);
+      box-shadow: 0 10px 24px rgba(0,0,0,.35) inset;
+      background: rgba(0,0,0,.35);
+    }
+
+    .sp-player iframe{
+      width:100%;
+      height:152px; /* desktop */
+      border:0;
+      display:block;
+      background: transparent; /* iframe içi değil, sadece dış */
+    }
+
+/* Buton gövdesi */
+.btn-contact{
+  display:inline-flex;
+  align-items:center;
+  gap:.65rem;
+  padding:.70rem .95rem;
+  border-radius:12px;
+  border:1px solid rgba(255,255,255,.14);
+  background: rgba(255,255,255,.03);
+  color: var(--text);
+  text-decoration:none;
+  font-weight:600;
+  letter-spacing:.15px;
+  transition: transform .14s ease, background .14s ease, border-color .14s ease, filter .14s ease;
+  user-select:none;
+}
+
+.btn-contact:hover{
+  transform: translateY(-1px);
+  background: rgba(255,255,255,.05);
+  border-color: rgba(255,255,255,.22);
+}
+
+.btn-contact:active{
+  transform: translateY(0);
+  filter: brightness(.98);
+}
+
+.btn-contact:focus-visible{
+  outline:2px solid rgba(255,255,255,.28);
+  outline-offset:3px;
+}
+
+.mail-logo{
+  position:relative;
+  width:22px;
+  height:16px;
+  flex:0 0 auto;
+}
+
+/* zarf gövdesi */
+.mail-logo i:nth-child(1){
+  position:absolute;
+  inset:0;
+  background:linear-gradient(145deg,#e5e7eb,#cbd5e1);
+  border-radius:6px;
+  box-shadow:
+    inset 0 1px 0 rgba(255,255,255,.35),
+    0 1px 2px rgba(0,0,0,.25);
+  overflow:hidden; /* taşmayı kesin keser */
+}
+
+/* M formu (kapak çizgisi) */
+.mail-logo i:nth-child(2){
+  position:absolute;
+  inset:2px; /* kenardan içeri al */
+  background:rgba(0,0,0,.18);
+  clip-path:polygon(
+    0 0,
+    50% 65%,
+    100% 0,
+    100% 12%,
+    50% 75%,
+    0 12%
+  );
+  border-radius:3px;
+}
+
+.mail-logo i:nth-child(2)::before,
+.mail-logo i:nth-child(2)::after{
+  content:"";
+  position:absolute;
+  width:50%;
+  height:100%;
+  top:0;
+  background:transparent;
+  border-top:2px solid rgba(0,0,0,.25);
+}
+
+/* sol kapak */
+.mail-logo i:nth-child(2)::before{
+  left:0;
+  transform-origin:right top;
+  transform:skewY(25deg);
+  border-left:2px solid rgba(0,0,0,.15);
+  border-top-left-radius:6px;
+}
+
+/* sağ kapak */
+.mail-logo i:nth-child(2)::after{
+  right:0;
+  transform-origin:left top;
+  transform:skewY(-25deg);
+  border-right:2px solid rgba(0,0,0,.15);
+  border-top-right-radius:6px;
+}
+
+
+    /* Microsoft login button (mütevazı + logo solda) */
+  .btn-ms{
+    display:inline-flex;
+    align-items:center;
+    gap:.65rem;
+    padding:.70rem .95rem;
+    border-radius:12px;
+    border:1px solid rgba(255,255,255,.14);
+    background: rgba(255,255,255,.03);
+    color: var(--text);
+    text-decoration:none;
+    font-weight:600;
+    letter-spacing:.15px;
+    transition: transform .14s ease, background .14s ease, border-color .14s ease, filter .14s ease;
+    user-select:none;
+  }
+
+  .btn-ms:hover{
+    transform: translateY(-1px);
+    background: rgba(255,255,255,.05);
+    border-color: rgba(255,255,255,.22);
+  }
+
+  .btn-ms:active{
+    transform: translateY(0px);
+    filter: brightness(.98);
+  }
+
+  .btn-ms:focus-visible{
+    outline:2px solid rgba(255,255,255,.28);
+    outline-offset:3px;
+  }
+
+  .btn-ms .ms-logo{
+    width:18px;
+    height:18px;
+    display:grid;
+    grid-template-columns:repeat(2, 1fr);
+    grid-template-rows:repeat(2, 1fr);
+    gap:2px;
+    flex:0 0 auto;
+  }
+
+  .btn-ms .ms-logo i{
+    display:block;
+    border-radius:3px;
+  }
+
+  .btn-ms .ms-logo i:nth-child(1){background:#F25022;}
+  .btn-ms .ms-logo i:nth-child(2){background:#7FBA00;}
+  .btn-ms .ms-logo i:nth-child(3){background:#00A4EF;}
+  .btn-ms .ms-logo i:nth-child(4){background:#FFB900;}
+
+/* Şiir bloğu (aside-card içinde) */
+.poem{
+  margin-top: .95rem;
+  padding-top: .9rem;
+  border-top: 1px solid var(--border);
+  text-align: left;
+}
+
+.poem-title{
+  font-weight: 700;
+  letter-spacing: .2px;
+  margin-bottom: .35rem;
+  color: rgba(244,244,245,.92);
+}
+
+.poem-body{
+  color: var(--muted);
+  font-size: .98rem;
+  line-height: 1.55;
+  font-family: ui-serif, Georgia, "Times New Roman", Times, serif;
+}
+
+.poem-sign{
+  margin-top: .55rem;
+  font-size: .88rem;
+  color: rgba(161,161,170,.85);
+  font-family: system-ui,-apple-system,Segoe UI,Roboto;
+}
+
+/* Not: aside zaten mobilde kapalı. Ekstra emniyet istersen: */
+@media (max-width: 900px){
+  .poem{ display:none; }
+}
+
+    /* ===== Aside / Atatürk ===== */
+    aside{
+      display:flex;
+      flex-direction:column;
+      gap:1.35rem;
+      position:sticky;
+      top:1.2rem;
+      align-self:start;
+    }
+
+    .aside-card{
+      background:var(--card);
+      border:1px solid var(--border);
+      border-radius:var(--radius);
+      padding:1rem;
+      text-align:center;
+      box-shadow: var(--shadowSoft);
+    }
+
+    .aside-card img{
+      width:100%;
+      border-radius:14px;
+      display:block;
+      filter: grayscale(100%);
+    }
+
+    .quote{
+      margin:.95rem 0 0 0;
+      color:var(--muted);
+      font-size:1.02rem;
+      line-height:1.45;
+      font-family: ui-serif, Georgia, "Times New Roman", Times, serif;
+      letter-spacing:.2px;
+    }
+    .quote small{
+      display:block;
+      margin-top:.55rem;
+      font-size:.88rem;
+      color: rgba(161,161,170,.85);
+      font-family: system-ui,-apple-system,Segoe UI,Roboto;
+    }
+
+    footer{
+      text-align:center;
+      padding:1.4rem 1rem;
+      border-top:1px solid var(--border);
+      color:var(--muted);
+      font-size:.9rem;
+      margin-top:2rem;
+    }
+
+    /* ===== Mobile ===== */
+    @media (max-width: 900px){
+      .layout{grid-template-columns:1fr; gap:1.25rem; margin:1.4rem auto}
+      aside{display:none}
+      header{padding:2.1rem 1.15rem}
+      header h1{font-size:1.8rem}
+      section{padding:1.25rem}
+      .sp-spotify-title{font-size:1.9rem}
+      .sp-name{font-size:1.75rem}
+      .sp-avatar{width:74px;height:74px}
+
+      .sp-player{padding:12px}
+      .sp-player iframe{height:232px} /* mobilde daha rahat */
+    }
+
+    @media (max-width: 420px){
+      .sp-name{font-size:1.55rem}
+      .sp-sub{font-size:.88rem}
+    }
+    @font-face{
+  font-family:"SpotifyMix";
+  font-weight:800;
+  font-style:normal;
+  font-display:swap;
+}
+
+  </style>
+</head>
+
+<body>
+  <header>
+    <h1>Aybars Yıldırım</h1>
+  </header>
+
+  <div class="layout">
+    <main class="stack">
+
+      <section class="highlight">
+        <h2>Hakkımda</h2>
+        <p>2025–2026 eğitim döneminde 2. sınıf <strong>Cumhuriyet Üniversitesi Tıp Fakültesi</strong> öğrencisiyim. <br>Yazılımda, güvenlik ve ağ geliştirme üzerine çalışıyorum.</p>
+      </section>
+
+      <!-- Spotify -->
+      <section style="padding:0">
+        <div class="spotify-hero">
+          <a id="spProfileLink" class="sp-profilelink" href="#" target="_blank" rel="noopener">
+            <div class="sp-banner">
+              <div class="sp-toprow">
+                <div class="sp-avatar">
+                  <img id="spAvatar" src="https://storage.aybars.net.tr/spotify.jpg" alt="Spotify Profil">
+                </div>
+                <div class="sp-text">
+                  <div class="sp-label">Spotify</div>
+                    <div id="spName" class="sp-name sp-spotify-title">Aybars</div>
+                  <div class="sp-sub" id="spSub">Profili görüntüle</div>
+                </div>
+              </div>
+            </div>
+          </a>
+
+          <div class="sp-player">
+            <div class="sp-iframewrap">
+              <iframe id="spEmbed"
+                src=""
+                allow="autoplay; clipboard-write; encrypted-media; fullscreen; picture-in-picture"
+                loading="lazy"></iframe>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Bağlantılar -->
+      <section>
+        <h2>Bağlantılar</h2>
+        <div class="btn-row"> 
+          <a class="btn-ms" href="/login">
+        <span class="ms-logo" aria-hidden="true">
+          <i></i><i></i><i></i><i></i>
+        </span>
+        Kişisel Ağ Hizmetleri
+      </a>
+      <a class="btn-ms" href="https://trust.fitfak.net/login">
+        <span class="ms-logo" aria-hidden="true">
+          <i></i><i></i><i></i><i></i>
+        </span>
+        Uç Ağ Hizmetleri
+      </a>
+      <a class="btn-contact" href="mailto:mail@aybars.net.tr">
+  <span class="mail-logo" aria-hidden="true">
+    <i></i><i></i>
+  </span>
+  Benimle İletişime Geç
+</a>
+        </div>
+      </section>
+      
+    </main>
+
+    <!-- Atatürk kartı (masaüstü) -->
+    <aside>
+      <div class="aside-card">
+        <img src="https://storage.aybars.net.tr/ataturk.jpg" alt="Mustafa Kemal Atatürk">
+        <p class="quote">
+          En doğru ve en hakiki tarikat, tarikat-ı medeniyedir.
+          <small>Mustafa Kemal Atatürk</small>
+        </p>
+            <div class="poem">
+      <!-- <div class="poem-title">Uzaktan Seviyorum Seni</div> -->
+      <div class="poem-body">
+Bazı günler uyandığımda hangi günde olduğumuzu bir türlü hatırlayamıyorum. <br>
+Pazartesi, perşembe, pazar insanın hayatında günlerin bir anlamı olmalı.<br>
+Hafta yedi ayrı gün değil de üç gün olsaydı ne değişirdi hayatımda?<br>
+Ya da saatin kaç olduğu hangi günde olduğundan daha mı önemli?<br>
+Bilmiyorum..<br>
+      </div>
+      <!-- <div class="poem-sign">— Cemal Süreya</div> -->
+    </div>
+      </div>
+    </aside>
+  </div>
+
+  <footer>© 2026 Aybars Yıldırım</footer>
+
+  <script>
+    // ===========================
+    // AYARLAR
+    // ===========================
+    const SPOTIFY_PROFILE_URL = "https://open.spotify.com/user/rf5cogwvymmcqz2n0hiufaecl";
+
+    // Not: Spotify embed'in arka planını tamamen kaldıramazsın.
+    // Uyum için dark tema kullan: theme=0
+    const SPOTIFY_EMBED_URL =
+      "https://open.spotify.com/embed/track/66kO1Sr99392GvDZWKdCiv?theme=0";
+
+    const SPOTIFY_AVATAR_URL  = "https://storage.aybars.net.tr/spotify.jpg";
+
+    const DISPLAY_NAME = "Aybars";
+    const DISPLAY_SUB  = "Profili görüntüle";
+
+    // ===========================
+    // SETUP
+    // ===========================
+    document.getElementById("spProfileLink").href = SPOTIFY_PROFILE_URL;
+    document.getElementById("spEmbed").src = SPOTIFY_EMBED_URL;
+
+    document.getElementById("spAvatar").src = SPOTIFY_AVATAR_URL;
+    document.getElementById("spName").textContent = DISPLAY_NAME;
+    document.getElementById("spSub").textContent = DISPLAY_SUB;
+  </script>
+</body>
+</html>

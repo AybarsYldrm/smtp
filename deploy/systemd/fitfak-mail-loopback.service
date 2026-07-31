@@ -1,0 +1,22 @@
+[Unit]
+Description=Fitfak posta sunucusu için ek loopback adresleri
+Documentation=https://github.com/AybarsYldrm/smtp
+After=network-pre.target
+Before=network.target cloudflared.service fitfak-mail.service
+
+# Her vhost kendi loopback adresine bağlanır: 127.0.1.1 kişisel site,
+# 127.0.1.2 webmail. 127.0.1.1 çoğu dağıtımda hazır gelir, .2 gelmez.
+# İkisini tek adrese koyup yalnızca Host başlığıyla ayırmak da mümkündü, ama
+# o zaman yanlış yapılandırılmış bir tünel diğerinin trafiğini görebilirdi.
+# Ayrı adres, ayrı soket: yanlış tünel bağlanamaz bile.
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Adres zaten varsa hata vermesin (yeniden başlatmada olağan durum).
+ExecStart=/bin/sh -c 'ip addr add 127.0.1.1/8 dev lo 2>/dev/null || true'
+ExecStart=/bin/sh -c 'ip addr add 127.0.1.2/8 dev lo 2>/dev/null || true'
+ExecStop=/bin/sh -c 'ip addr del 127.0.1.2/8 dev lo 2>/dev/null || true'
+
+[Install]
+WantedBy=multi-user.target

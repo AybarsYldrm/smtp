@@ -1,0 +1,286 @@
+/*
+ * Fitfak arayüz temeli.
+ *
+ * Renkler session.fitfak.net'teki fitfak-ui.css ile aynı ailede: koyu lacivert
+ * zemin, altın vurgu. Bu dosya YEDEK olarak duruyor — sayfalar önce uzak
+ * fitfak-ui.css'i yüklüyor, o erişilemezse arayüz yine de kullanılabilir
+ * kalıyor. Uzak dosya yüklendiğinde aynı değişken adlarını ezdiği için iki
+ * kaynak çakışmıyor.
+ */
+
+:root {
+  --ff-bg: #12142b;
+  --ff-bg-alt: #171a35;
+  --ff-surface: #1b1e42;
+  --ff-surface-2: #212550;
+  --ff-border: #33375f;
+  --ff-border-soft: #2a2e52;
+  --ff-text: #edeef7;
+  --ff-text-muted: #9aa0c4;
+  --ff-text-dim: #6f76a0;
+  --ff-accent: #d4a94e;
+  --ff-accent-soft: rgba(212, 169, 78, 0.14);
+  --ff-accent-strong: #e8bd62;
+  --ff-danger: #e2645a;
+  --ff-danger-soft: rgba(226, 100, 90, 0.14);
+  --ff-success: #5cc9a7;
+  --ff-success-soft: rgba(92, 201, 167, 0.14);
+  --ff-warning: #e0a75f;
+  --ff-info: #6a9be8;
+
+  --ff-radius: 12px;
+  --ff-radius-lg: 18px;
+  --ff-radius-sm: 8px;
+  --ff-shadow: 0 12px 34px rgba(0, 0, 0, 0.34);
+  --ff-shadow-sm: 0 4px 14px rgba(0, 0, 0, 0.22);
+  --ff-font: "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --ff-mono: ui-monospace, "SF Mono", "JetBrains Mono", "Fira Code", Menlo, Consolas, monospace;
+
+  --ff-space-1: 4px;
+  --ff-space-2: 8px;
+  --ff-space-3: 12px;
+  --ff-space-4: 16px;
+  --ff-space-5: 24px;
+  --ff-space-6: 32px;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  padding: 0;
+  min-height: 100%;
+}
+
+body {
+  background: var(--ff-bg);
+  color: var(--ff-text);
+  font-family: var(--ff-font);
+  font-size: 15px;
+  line-height: 1.55;
+  -webkit-font-smoothing: antialiased;
+}
+
+a { color: var(--ff-accent); text-decoration: none; }
+a:hover { color: var(--ff-accent-strong); text-decoration: underline; }
+
+h1, h2, h3, h4 { margin: 0 0 var(--ff-space-3); line-height: 1.25; font-weight: 650; }
+h1 { font-size: 1.75rem; }
+h2 { font-size: 1.3rem; }
+h3 { font-size: 1.05rem; }
+p { margin: 0 0 var(--ff-space-3); }
+
+code, pre, .ff-mono { font-family: var(--ff-mono); font-size: 0.86em; }
+
+/* ── düzen ──────────────────────────────────────────────────── */
+
+.ff-center {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 100vh;
+  padding: var(--ff-space-5);
+}
+
+.ff-card {
+  background: var(--ff-surface);
+  border: 1px solid var(--ff-border);
+  border-radius: var(--ff-radius-lg);
+  padding: var(--ff-space-6);
+  box-shadow: var(--ff-shadow);
+  max-width: 560px;
+  width: 100%;
+}
+
+.ff-panel {
+  background: var(--ff-surface);
+  border: 1px solid var(--ff-border);
+  border-radius: var(--ff-radius);
+  padding: var(--ff-space-4);
+}
+
+.ff-stack { display: flex; flex-direction: column; gap: var(--ff-space-4); }
+.ff-row { display: flex; align-items: center; gap: var(--ff-space-3); }
+.ff-row-wrap { display: flex; align-items: center; gap: var(--ff-space-3); flex-wrap: wrap; }
+.ff-spacer { flex: 1; }
+
+/* ── düğmeler ───────────────────────────────────────────────── */
+
+.ff-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--ff-space-2);
+  padding: 9px 16px;
+  border-radius: var(--ff-radius-sm);
+  border: 1px solid var(--ff-border);
+  background: var(--ff-surface-2);
+  color: var(--ff-text);
+  font: inherit;
+  font-weight: 600;
+  font-size: 0.92rem;
+  cursor: pointer;
+  transition: background 0.15s ease, border-color 0.15s ease, transform 0.06s ease;
+  text-decoration: none;
+  white-space: nowrap;
+}
+.ff-btn:hover { background: #272c5e; border-color: #3f4470; text-decoration: none; color: var(--ff-text); }
+.ff-btn:active { transform: translateY(1px); }
+.ff-btn:disabled, .ff-btn[aria-disabled="true"] { opacity: 0.5; cursor: not-allowed; transform: none; }
+
+.ff-btn-primary {
+  background: var(--ff-accent);
+  border-color: var(--ff-accent);
+  color: #17182c;
+}
+.ff-btn-primary:hover { background: var(--ff-accent-strong); border-color: var(--ff-accent-strong); color: #17182c; }
+
+.ff-btn-ghost { background: transparent; border-color: transparent; color: var(--ff-text-muted); }
+.ff-btn-ghost:hover { background: rgba(255, 255, 255, 0.05); color: var(--ff-text); }
+
+.ff-btn-danger { color: var(--ff-danger); border-color: rgba(226, 100, 90, 0.35); background: var(--ff-danger-soft); }
+.ff-btn-danger:hover { background: rgba(226, 100, 90, 0.22); border-color: var(--ff-danger); color: var(--ff-danger); }
+
+.ff-btn-sm { padding: 5px 10px; font-size: 0.82rem; }
+.ff-btn-icon { padding: 7px; width: 34px; height: 34px; }
+
+/* ── form ───────────────────────────────────────────────────── */
+
+.ff-field { display: flex; flex-direction: column; gap: 6px; }
+.ff-label { font-size: 0.82rem; font-weight: 600; color: var(--ff-text-muted); letter-spacing: 0.01em; }
+
+.ff-input, .ff-textarea, .ff-select {
+  width: 100%;
+  padding: 9px 12px;
+  border-radius: var(--ff-radius-sm);
+  border: 1px solid var(--ff-border);
+  background: var(--ff-bg-alt);
+  color: var(--ff-text);
+  font: inherit;
+  font-size: 0.94rem;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+.ff-input:focus, .ff-textarea:focus, .ff-select:focus {
+  outline: none;
+  border-color: var(--ff-accent);
+  box-shadow: 0 0 0 3px var(--ff-accent-soft);
+}
+.ff-input::placeholder, .ff-textarea::placeholder { color: var(--ff-text-dim); }
+.ff-textarea { resize: vertical; min-height: 120px; line-height: 1.6; }
+
+.ff-check { display: inline-flex; align-items: center; gap: var(--ff-space-2); cursor: pointer; user-select: none; }
+.ff-check input { accent-color: var(--ff-accent); width: 16px; height: 16px; cursor: pointer; }
+
+/* ── rozetler ve durum ──────────────────────────────────────── */
+
+.ff-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 0.72rem;
+  font-weight: 650;
+  letter-spacing: 0.02em;
+  border: 1px solid var(--ff-border);
+  background: var(--ff-surface-2);
+  color: var(--ff-text-muted);
+  white-space: nowrap;
+}
+.ff-badge-ok { color: var(--ff-success); border-color: rgba(92, 201, 167, 0.35); background: var(--ff-success-soft); }
+.ff-badge-warn { color: var(--ff-warning); border-color: rgba(224, 167, 95, 0.35); background: rgba(224, 167, 95, 0.12); }
+.ff-badge-danger { color: var(--ff-danger); border-color: rgba(226, 100, 90, 0.35); background: var(--ff-danger-soft); }
+.ff-badge-accent { color: var(--ff-accent); border-color: rgba(212, 169, 78, 0.35); background: var(--ff-accent-soft); }
+
+.ff-note {
+  padding: var(--ff-space-3) var(--ff-space-4);
+  border-radius: var(--ff-radius-sm);
+  border: 1px solid var(--ff-border);
+  background: var(--ff-bg-alt);
+  color: var(--ff-text-muted);
+  font-size: 0.88rem;
+}
+.ff-note-warn { border-color: rgba(224, 167, 95, 0.35); background: rgba(224, 167, 95, 0.09); color: #e8c48c; }
+.ff-note-danger { border-color: rgba(226, 100, 90, 0.35); background: var(--ff-danger-soft); color: #f0a49d; }
+.ff-note-ok { border-color: rgba(92, 201, 167, 0.3); background: var(--ff-success-soft); color: #9fe0cb; }
+
+.ff-empty {
+  text-align: center;
+  padding: var(--ff-space-6);
+  color: var(--ff-text-dim);
+  font-style: italic;
+}
+
+/* ── tablo ──────────────────────────────────────────────────── */
+
+.ff-table-wrap { overflow-x: auto; border-radius: var(--ff-radius); border: 1px solid var(--ff-border); }
+.ff-table { width: 100%; border-collapse: collapse; font-size: 0.9rem; min-width: 520px; }
+.ff-table th, .ff-table td { padding: 11px 14px; text-align: left; border-bottom: 1px solid var(--ff-border-soft); }
+.ff-table th {
+  background: var(--ff-surface-2);
+  color: var(--ff-text);
+  font-weight: 650;
+  font-size: 0.82rem;
+  letter-spacing: 0.02em;
+  position: sticky;
+  top: 0;
+}
+.ff-table td { color: var(--ff-text-muted); }
+.ff-table tr:last-child td { border-bottom: none; }
+.ff-table tbody tr:hover td { background: rgba(255, 255, 255, 0.02); }
+
+/* ── yardımcılar ────────────────────────────────────────────── */
+
+.ff-muted { color: var(--ff-text-muted); }
+.ff-dim { color: var(--ff-text-dim); }
+.ff-small { font-size: 0.84rem; }
+.ff-tiny { font-size: 0.76rem; }
+.ff-truncate { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ff-bold { font-weight: 650; }
+.ff-hidden { display: none !important; }
+.ff-scroll { overflow-y: auto; }
+
+.ff-scroll::-webkit-scrollbar { width: 10px; height: 10px; }
+.ff-scroll::-webkit-scrollbar-track { background: transparent; }
+.ff-scroll::-webkit-scrollbar-thumb { background: var(--ff-border); border-radius: 6px; border: 2px solid var(--ff-bg); }
+.ff-scroll::-webkit-scrollbar-thumb:hover { background: #454a78; }
+
+.ff-spinner {
+  width: 16px;
+  height: 16px;
+  border: 2px solid var(--ff-border);
+  border-top-color: var(--ff-accent);
+  border-radius: 50%;
+  animation: ff-spin 0.7s linear infinite;
+  display: inline-block;
+}
+@keyframes ff-spin { to { transform: rotate(360deg); } }
+
+/* Hareketi azalt tercihi: animasyonlar bazı kullanıcılarda baş dönmesi
+   yapıyor ve bu tercih tam olarak bunun için var. */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+/* Açık tema: sistem tercihi açıksa okunabilir kalmalı. Renkler koyu tema
+   için tasarlandı; açıkta yalnızca zemin ve metin çevriliyor. */
+@media (prefers-color-scheme: light) {
+  :root[data-ff-theme="auto"] {
+    --ff-bg: #f4f5fb;
+    --ff-bg-alt: #ffffff;
+    --ff-surface: #ffffff;
+    --ff-surface-2: #eef0f8;
+    --ff-border: #d7dae9;
+    --ff-border-soft: #e5e7f2;
+    --ff-text: #1b1e42;
+    --ff-text-muted: #565c85;
+    --ff-text-dim: #8b90b0;
+    --ff-accent: #b08528;
+    --ff-accent-soft: rgba(176, 133, 40, 0.12);
+    --ff-shadow: 0 12px 34px rgba(27, 30, 66, 0.12);
+  }
+}
