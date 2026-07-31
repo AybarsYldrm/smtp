@@ -364,27 +364,25 @@ class SessionManager {
       return { ok: false, code: 'not_interactive', message: 'Bu işlem tarayıcı oturumu gerektirir.' };
     }
 
-    const scopes = String(session.scope || '').split(/\s+/).filter(Boolean);
-    if (requiredScope && !scopes.includes(requiredScope)) {
-      return {
-        ok: false,
-        code: 'scope_required',
-        requiredScope,
-        grantedScopes: scopes,
-        message: `Oturumunuz "${requiredScope}" kapsamını taşımıyor.`,
-      };
-    }
-
     let accessToken = await this.stores.sessions.getAccessToken(session);
+    let introspection = null;
+
     if (accessToken) {
       // Jeton hâlâ geçerli mi? Süresi dolmuş bir jetonla IdP'ye gitmek 401
       // döner ve o 401, arayüzde "sertifika alınamadı" olarak görünür.
-      const active = await this.idp.introspect(accessToken, { cacheMs: 10_000 })
-        .then((info) => info && info.active !== false)
-        .catch((err) => (err.temporary ? true : false));
-      if (active) return { ok: true, accessToken, scopes, refreshed: false };
-      this.logger.debug({ email: session.idpEmail, msg: 'IdP erişim jetonu geçersiz, yenileniyor' });
-      accessToken = null;
+      introspection = await this.idp.introspect(accessToken, { cacheMs: 10_000 })
+        .catch((err) => (err.temporary ? { active: true, _unreachable: true } : { active: false }));
+      if (!introspection || introspection.active === false) {
+        this.logger.debug({ email: session.idpEmail, msg: 'IdP erişim jetonu geçersiz, yenileniyor' });
+        accessToken = null;
+        introspection = null;
+      }
+    }
+
+    if (accessToken) {
+      const verdict = this._checkScope({ session, introspection, requiredScope });
+      if (!verdict.ok) return verdict;
+      return { ok: true, accessToken, scopes: verdict.scopes, scopeKnown: verdict.known, refreshed: false };
     }
 
     const refreshToken = await this.stores.sessions.getRefreshToken(session);
@@ -402,12 +400,21 @@ class SessionManager {
       await this.stores.sessions.updateIdpTokens(session, {
         accessToken: tokens.accessToken,
         refreshToken: tokens.refreshToken,
-        scope: tokens.scope || session.scope,
+        // `scope` YALNIZCA dolu geldiğinde yazılır — bkz. updateIdpTokens.
+        scope: tokens.scope,
       });
+      const fresh = await this.idp.introspect(tokens.accessToken, { cacheMs: 0 }).catch(() => null);
+      const verdict = this._checkScope({
+        session: { ...session, scope: tokens.scope || session.scope },
+        introspection: fresh,
+        requiredScope,
+      });
+      if (!verdict.ok) return verdict;
       return {
         ok: true,
         accessToken: tokens.accessToken,
-        scopes: String(tokens.scope || session.scope || '').split(/\s+/).filter(Boolean),
+        scopes: verdict.scopes,
+        scopeKnown: verdict.known,
         refreshed: true,
       };
     } catch (err) {
@@ -418,6 +425,61 @@ class SessionManager {
         message: `IdP jetonu yenilenemedi: ${err.message}`,
       };
     }
+  }
+
+  /**
+   * Kapsam denetimi — ve kimin karar verdiği.
+   *
+   * ── BİLDİRİLEN HATA: sonsuz 409 döngüsü ────────────────────────────────
+   * Kullanıcı `cert:issue` iznini veriyor, IdP geri yönlendiriyor, jeton
+   * takas ediliyor — ama sertifika isteği yine "Oturumunuz cert:issue
+   * kapsamını taşımıyor" diyordu. Sebep: bu IdP'nin `/oauth/token` yanıtı
+   * `scope` alanı İÇERMİYOR (yalnızca access_token, refresh_token,
+   * token_type, expires_in). Biz `scope: tokens.scope` yazınca oturumun
+   * kapsamı BOŞ dizgeye eziliyordu; onay her seferinde başarılı oluyor,
+   * kayıt her seferinde siliniyordu.
+   *
+   * İki ayrı düzeltme gerekiyor ve ikisi de burada:
+   *
+   *   1. Boş bir kapsam yanıtı, bilinen kapsamı SİLMEZ (bkz.
+   *      `SessionRepo.updateIdpTokens`).
+   *   2. Kapsamın kaynağı önce inceleme (RFC 7662 `scope`), sonra yerel
+   *      kayıt. İkisi de söylemiyorsa KARAR VERİLMEZ ve istek denenir:
+   *      yetkinin sahibi IdP'dir, bizim önbelleğimiz değil. Kapsam
+   *      gerçekten eksikse IdP reddeder ve o ret, tahmine dayalı bir 409'dan
+   *      çok daha doğru bir cevaptır.
+   *
+   * @returns {{ok: boolean, scopes?: string[], known?: boolean, code?: string, …}}
+   */
+  _checkScope({ session, introspection, requiredScope }) {
+    const fromIntrospection = introspection && typeof introspection.scope === 'string'
+      ? introspection.scope.split(/\s+/).filter(Boolean)
+      : null;
+    const fromSession = String(session.scope || '').split(/\s+/).filter(Boolean);
+
+    // İnceleme erişilemediyse (`_unreachable`) elimizdeki bilgi güvenilmez;
+    // kesinti bir yetkilendirme kararına çevrilmemeli.
+    const authoritative = introspection && introspection._unreachable ? null : fromIntrospection;
+    const scopes = authoritative || fromSession;
+    const known = !!(authoritative || fromSession.length);
+
+    if (!requiredScope) return { ok: true, scopes, known };
+    if (!known) {
+      this.logger.debug({
+        email: session.idpEmail, requiredScope,
+        msg: 'kapsam bilinmiyor — karar IdP\'ye bırakılıyor',
+      });
+      return { ok: true, scopes, known: false };
+    }
+    if (scopes.includes(requiredScope)) return { ok: true, scopes, known };
+
+    return {
+      ok: false,
+      code: 'scope_required',
+      requiredScope,
+      grantedScopes: scopes,
+      message: `Oturumunuz "${requiredScope}" kapsamını taşımıyor.`,
+    };
   }
 
   /**
@@ -460,13 +522,27 @@ class SessionManager {
       err.status = 401;
       throw err;
     }
+    // IdP jeton yanıtında `scope` döndürmüyorsa İSTEDİĞİMİZ kapsamı
+    // kaydediyoruz. Buraya gelmiş olmak, kullanıcının onay ekranını geçtiği
+    // ve IdP'nin bir kod verdiği anlamına geliyor — yani izin verildi. IdP
+    // aslında vermediyse asıl istek reddedilir ve o ret, bizim tahminimizden
+    // daha doğru bir cevap olur; kaydı boş bırakmak ise kullanıcıyı aynı
+    // onay ekranına sonsuza kadar geri gönderiyordu.
+    const granted = (tokens.scope || '').trim()
+      || [...new Set([...String(target.scope || '').split(/\s+/).filter(Boolean), stored.requestedScope])]
+        .filter(Boolean).join(' ');
+
     await this.stores.sessions.updateIdpTokens(target, {
       accessToken: tokens.accessToken,
       refreshToken: tokens.refreshToken,
-      scope: tokens.scope,
+      scope: granted,
     });
-    this.logger.info({ scope: tokens.scope, msg: 'oturum kapsamı yükseltildi' });
-    return { upgraded: true, returnTo: stored.returnTo || '/', scope: tokens.scope };
+    this.logger.info({
+      scope: granted,
+      reportedByIdp: !!(tokens.scope || '').trim(),
+      msg: 'oturum kapsamı yükseltildi',
+    });
+    return { upgraded: true, returnTo: stored.returnTo || '/', scope: granted };
   }
 
   async logout({ sid, revokeIdpSessions = false }) {

@@ -210,12 +210,12 @@ function signMessage({
   const signedParts = [];
   for (const name of hList) {
     const list = remaining.get(name);
-    if (!list || !list.length) {
-      // Listede olup iletide olmayan başlık: boş olarak kanonikleşir. Bu,
-      // oversigning'in çalışma biçimi.
-      signedParts.push(headerCanon === 'simple' ? '' : `${name}:`);
-      continue;
-    }
+    // Listede olup iletide OLMAYAN başlık hiçbir şey katmaz (§3.5: "null
+    // input, including the header field name, the separating colon, the
+    // header field value, and any CRLF terminator"). Bkz. `verifyMessage`
+    // içindeki aynı nottaki gerekçe — burada da atlamak zorunlu, yoksa
+    // ürettiğimiz imza kendi doğrulayıcımız dışında hiçbir yerde tutmaz.
+    if (!list || !list.length) continue;
     signedParts.push(canonHeader(list.shift().raw));
   }
   // İmzalanan son öğe, b= değeri BOŞ olan DKIM-Signature başlığının kendisi
@@ -478,7 +478,26 @@ async function verifyMessage(rawMessage, {
       const parts = [];
       for (const name of hNames) {
         const list = remaining.get(name);
-        if (!list || !list.length) { parts.push(headerCanon === 'simple' ? '' : `${name}:`); continue; }
+        // ── BİLDİRİLEN HATA: Gmail'den gelen her ileti "dkim fail" ────────
+        // h= listesinde OLUP iletide BULUNMAYAN bir başlık, imza girdisine
+        // HİÇBİR ŞEY katmaz. RFC 6376 §3.5 bunu açıkça söylüyor: "Nonexistent
+        // header fields do not contribute to the signature computation (that
+        // is, they are treated as the null input, including the header field
+        // name, the separating colon, the header field value, and any CRLF
+        // terminator)."
+        //
+        // Önceki hâli `${name}:` (relaxed) ya da boş dizge (simple) ekliyordu
+        // ve `join(CRLF)` yüzünden her biri fazladan bir CRLF de getiriyordu.
+        // Kendi imzalarımızda bu tutarlıydı — biz de aynı yanlışı imzalarken
+        // yapıyorduk — ama BAŞKASININ imzasında tutmuyordu.
+        //
+        // Etkisi tam olarak Gmail'de görünüyor, çünkü Gmail "oversigning"
+        // yapıyor: h= listesinde from/to/subject/cc/reply-to gibi adları İKİ
+        // kez sayıyor, ikinci geçişte çoğu bulunmuyor. Her bulunmayan ad
+        // girdiye birkaç bayt ekliyor, imza girdisi uzuyor ve imza —
+        // gövde özeti DOĞRUYKEN — tutmuyor. Kaydın söylediği de buydu:
+        // "gövde özeti doğru, imzalanan başlıklardan biri değişmiş".
+        if (!list || !list.length) continue;
         parts.push(canonHeader(list.shift().raw));
       }
       // Doğrulanan DKIM-Signature'ın kendisi, b= değeri boşaltılmış hâlde.

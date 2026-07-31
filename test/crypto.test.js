@@ -83,6 +83,81 @@ for (const algorithm of ['rsa', 'ed25519']) {
   });
 }
 
+/**
+ * Gmail'in imzaladığı gibi bir ileti.
+ *
+ * Gmail "oversigning" yapıyor: `h=` listesinde from/to/subject/cc/reply-to
+ * gibi adları İKİ kez sayıyor ve ikinci geçişte çoğu iletide bulunmuyor
+ * (`cc`, `reply-to` hiç yok). RFC 6376 §3.5 bulunmayan başlığın imza
+ * girdisine HİÇBİR ŞEY katmadığını söylüyor; onları boş bir `ad:` olarak
+ * eklemek girdiyi uzatıyor ve imza — gövde özeti doğruyken — tutmuyor.
+ *
+ * İmza burada elle, RFC'ye göre üretiliyor: doğrulayıcının kendi
+ * imzalayıcımızla değil, DIŞ bir imzalayıcıyla uyuştuğunu göstermenin tek
+ * yolu bu. Aynı yanlışı iki tarafta da yaparsak test geçer ama Gmail yine
+ * başarısız olur — nitekim öyle oluyordu.
+ */
+runner.test('DKIM: oversign edilmiş h= listesindeki eksik başlıklar girdiye katılmaz', async () => {
+  const keys = dkim.generateKeyPair({ algorithm: 'rsa' });
+  const message = [
+    'Content-Type: multipart/alternative; boundary="00000000000045ab"',
+    'To: network@fitfak.net',
+    'Subject: Test',
+    'Message-ID: <CAOxyz@mail.gmail.com>',
+    'Date: Fri, 31 Jul 2026 16:41:00 +0000',
+    'From: Aybars <aybarsyildirim.mail@gmail.com>',
+    'MIME-Version: 1.0',
+    '',
+    '--00000000000045ab',
+    'Content-Type: text/plain; charset="UTF-8"',
+    '',
+    'merhaba',
+    '--00000000000045ab--',
+    '',
+  ].join('\r\n');
+
+  // Gmail'in gerçek h= listesi: cc ve reply-to iletide YOK, altı ad iki kez.
+  const hTag = 'content-type:to:subject:message-id:date:from:mime-version'
+    + ':from:to:cc:subject:date:message-id:reply-to:content-type';
+
+  const { headers, body } = dkim.splitMessage(Buffer.from(message, 'utf8'));
+  const remaining = new Map();
+  for (const h of headers) {
+    if (!remaining.has(h.name)) remaining.set(h.name, []);
+    remaining.get(h.name).push(h);
+  }
+  for (const list of remaining.values()) list.reverse();
+
+  const tags = [
+    'v=1', 'a=rsa-sha256', 'c=relaxed/relaxed', 'd=gmail.com', 's=20251104',
+    `h=${hTag}`, `bh=${dkim.bodyHash(body, { canon: 'relaxed', hash: 'sha256' })}`, 'b=',
+  ];
+  const unsigned = `DKIM-Signature: ${tags.join('; ')}`;
+
+  const parts = [];
+  for (const name of hTag.split(':')) {
+    const list = remaining.get(name);
+    if (!list || !list.length) continue;   // RFC: bulunmayan başlık = null input
+    parts.push(dkim.canonicalizeHeaderRelaxed(list.shift().raw));
+  }
+  parts.push(dkim.canonicalizeHeaderRelaxed(unsigned));
+
+  const signature = crypto
+    .sign('sha256', Buffer.from(parts.join('\r\n'), 'binary'), crypto.createPrivateKey(keys.privateKeyPem))
+    .toString('base64');
+  const signed = Buffer.from(
+    `DKIM-Signature: ${tags.slice(0, -1).join('; ')}; b=${signature}\r\n${message}`,
+    'binary',
+  );
+
+  const verdict = await dkim.verifyMessage(signed, {
+    keyLookup: async () => [dkim.dnsRecordFromPrivateKey(keys.privateKeyPem)],
+    diagnostics: true,
+  });
+  assertEqual(verdict.results[0].bodyHashMatch, true, 'gövde özeti tutmalı');
+  assertEqual(verdict.overall, 'pass', `dış imzalayıcının imzası doğrulanmalı: ${verdict.reason || ''}`);
+});
+
 runner.test('DKIM: h= listesi bir adın ortasından katlanmış imza yine okunur', async () => {
   // Başka bir imzalayıcı aynı hatayı yapmış olabilir. Boşlukları atarak
   // okumak, o imzaları kurtarıyor; başlık adları boşluk içeremediği için

@@ -423,6 +423,12 @@ module.exports = {
       { no: 17, name: 'createdBySub', type: 'string' },
       { no: 18, name: 'compromisedAt', type: 'uint64' },
       { no: 19, name: 'compromiseReason', type: 'string' },
+      // Zarfın base64 hâli. `ciphertext` (bytes) ile AYNI veriyi taşıyor ve
+      // okurken bu tercih ediliyor: `bytes` alanının tel üzerindeki temsili
+      // sürücüye göre değişiyor (Buffer / base64 dizge / {type:'Buffer'}) ve
+      // yanlış çözülen bir zarf, yazıldıktan saniyeler sonra açılamaz hâle
+      // geliyordu. Dizgeyi hiçbir taşıma katmanı yeniden yorumlamıyor.
+      { no: 20, name: 'ciphertextB64', type: 'string' },
     ],
   },
 

@@ -69,6 +69,12 @@ function registerWebmailRoutes(router, deps) {
     return session;
   }
 
+  /** Eksik kapsam için onay adresi — hem yerel hem IdP kaynaklı retlerde aynı. */
+  function scopeUpgradeUrl(returnTo) {
+    return `/oauth/upgrade-scope?scope=${encodeURIComponent(config.trust.issueScope)}`
+      + `&return_to=${encodeURIComponent(returnTo || '/')}`;
+  }
+
   /** Durum değiştiren istekler için CSRF. API jetonunda gerekmez. */
   function requireCsrf(ctx, session) {
     if (session.isApiToken) return;
@@ -704,13 +710,11 @@ function registerWebmailRoutes(router, deps) {
       // Kapsam eksik: kullanıcıyı onay turuna yönlendirebilmesi için arayüze
       // adresi veriyoruz. 403 ile "yetkiniz yok" demek yanlış olurdu —
       // yetkisi var, henüz istemedik.
-      const returnTo = String(ctx.state.input.fields.returnTo || '/');
       throw new HttpError(409, delegated.message, {
         code: delegated.code === 'scope_required' ? 'CERT_SCOPE_REQUIRED' : 'IDP_REAUTH_REQUIRED',
         detail: {
           requiredScope: config.trust.issueScope,
-          authorizeUrl: `/yetki-yukselt?kapsam=${encodeURIComponent(config.trust.issueScope)}`
-            + `&donus=${encodeURIComponent(returnTo)}`,
+          authorizeUrl: scopeUpgradeUrl(String(ctx.state.input.fields.returnTo || '/')),
         },
       });
     }
@@ -726,6 +730,18 @@ function registerWebmailRoutes(router, deps) {
         mailbox: mailbox.address, status: result.status, code: result.code,
         reason: result.reason, msg: 'sertifika isteği başarısız',
       });
+      // Kapsamı eksik olduğunu bize IdP söyledi: yerelde tahmin etmediğimiz
+      // için buraya kadar geldik ve şimdi kesin bilgiyle onay turuna
+      // gönderebiliyoruz.
+      if (result.scopeRequired) {
+        throw new HttpError(409, result.reason, {
+          code: 'CERT_SCOPE_REQUIRED',
+          detail: {
+            requiredScope: config.trust.issueScope,
+            authorizeUrl: scopeUpgradeUrl(String(ctx.state.input.fields.returnTo || '/')),
+          },
+        });
+      }
       throw new HttpError(result.retryable ? 503 : 502, result.reason, {
         code: (result.code || 'CERT_FAILED').toUpperCase(),
         detail: result.hint ? { hint: result.hint } : null,

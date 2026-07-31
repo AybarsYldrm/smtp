@@ -240,7 +240,14 @@ class SessionRepo {
       });
       patch.refreshTokenSecretRef = name;
     }
-    if (scope != null) patch.scope = String(scope);
+    // Kapsam YALNIZCA dolu geldiğinde yazılır.
+    //
+    // Bazı IdP'ler jeton yanıtında `scope` döndürmüyor (RFC 6749 §5.1 onu
+    // yalnızca istenenden FARKLIYSA zorunlu kılıyor). Boş değeri olduğu gibi
+    // yazmak, bilinen kapsamı siliyor ve kullanıcı izni verdiği hâlde
+    // "kapsamınız yok" döngüsüne düşürüyordu.
+    const trimmedScope = scope == null ? '' : String(scope).trim();
+    if (trimmedScope) patch.scope = trimmedScope;
     if (Object.keys(patch).length) await this.sessions.update(String(session.ref), patch);
     return patch;
   }

@@ -277,10 +277,17 @@ class CertificateManager {
     const code = (parsed && (parsed.error || parsed.code)) || `http_${status}`;
     const description = (parsed && (parsed.error_description || parsed.message)) || log.snippet(raw, 200);
     const hint = IDP_ERROR_HINTS[code] || null;
-    return new CertificateError(
+    const error = new CertificateError(
       `sertifika sunucusu reddetti (HTTP ${status}, ${code}): ${description}`,
       { code, status, hint, retryable: status >= 500 || status === 429 },
     );
+    // Kapsam eksikliği IdP tarafından bildirildiğinde arayüz kullanıcıyı
+    // onay turuna gönderebilmeli. Bunu yerelde tahmin etmek yerine IdP'nin
+    // söylemesine güveniyoruz: kapsamın sahibi o.
+    error.scopeRequired = code === 'insufficient_scope'
+      || code === 'invalid_scope'
+      || (status === 403 && /scope|kapsam/i.test(String(description)));
+    return error;
   }
 
   /* ── kutu başına sertifika ─────────────────────────────────── */
@@ -376,7 +383,7 @@ class CertificateManager {
       });
       return {
         status: 'failed', reason: err.message, code: err.code || 'request_failed',
-        hint: err.hint || null, retryable: !!err.retryable,
+        hint: err.hint || null, retryable: !!err.retryable, scopeRequired: !!err.scopeRequired,
       };
     }
 

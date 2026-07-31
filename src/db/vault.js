@@ -53,12 +53,13 @@ class KeyVault {
   }
 
   /**
-   * @param {Buffer} envelope
+   * @param {Buffer|Uint8Array|string|object} envelope
    * @param {string} aad
    * @param {string} [wrapKeyId] kaydın sarıldığı anahtarın kimliği
    */
   _unwrap(envelope, aad, wrapKeyId = null) {
-    const buf = Buffer.isBuffer(envelope) ? envelope : Buffer.from(envelope);
+    const buf = toBytes(envelope);
+    if (!buf) throw new Error('[vault] zarf okunamadı (beklenmeyen tür)');
     if (buf.length < 29) throw new Error('[vault] bozuk zarf');
 
     // Anahtar uyuşmazlığı ÖNCE denetlenir. Aksi hâlde AES-GCM'in
@@ -116,13 +117,20 @@ class KeyVault {
     const secretKey = KeyVault.keyFor(kind, name, version);
     const now = Date.now();
 
+    const envelope = this._wrap(plaintext, KeyVault.aadFor(kind, name, version));
     const record = {
       secretKey,
       kind,
       name,
       version,
       status: activate ? STATUS.ACTIVE : STATUS.PENDING,
-      ciphertext: this._wrap(plaintext, KeyVault.aadFor(kind, name, version)),
+      ciphertext: envelope,
+      // Zarf AYRICA base64 dizge olarak saklanıyor ve okurken bu alan
+      // tercih ediliyor. Sebebi `toBytes`ın başındaki not: `bytes` alanının
+      // tel üzerindeki temsili sürücüye göre değişiyor ve yanlış çözülen
+      // bir zarf, yazıldıktan saniyeler sonra açılamaz hâle geliyor.
+      // Dizgeyi hiçbir taşıma katmanı yeniden yorumlamıyor.
+      ciphertextB64: envelope.toString('base64'),
       wrapAlg: 'AES-256-GCM/HKDF-SHA256',
       wrapKeyId: this.wrapKeyId,
       contentType,
@@ -137,6 +145,30 @@ class KeyVault {
       compromiseReason: '',
     };
     const id = await this.collection.insert(record);
+
+    // Yazılan sır GERİ OKUNUP açılıyor.
+    //
+    // Açılamayan bir sır, yazıldığı anda değil KULLANILDIĞI anda fark
+    // ediliyor: DKIM anahtarı için bu, ilk postanın gönderileceği an;
+    // IdP jetonu için oturumun yenileneceği an. O noktada elde yalnızca bir
+    // GCM hatası oluyor ve nedenin sürücünün bayt temsili olduğu
+    // anlaşılmıyor. Bir okuma fazladan yapmak, bu sınıftaki her hatayı
+    // kaynağında ve anlaşılır biçimde yakalıyor.
+    const written = await this._row(kind, name, version);
+    try {
+      const check = this._unwrap(
+        written && (written.ciphertextB64 || written.ciphertext),
+        KeyVault.aadFor(kind, name, version),
+        written && written.wrapKeyId,
+      );
+      if (!check.equals(plaintext)) throw new Error('geri okunan içerik yazılanla aynı değil');
+    } catch (err) {
+      throw new Error(
+        `[vault] ${kind}/${name} v${version} yazıldı ama geri okunamadı: ${err.message}. `
+        + 'Bu neredeyse her zaman veritabanı sürücüsünün bayt alanlarını olduğu gibi '
+        + 'döndürmemesinden kaynaklanır (bkz. src/db/vault.js -> toBytes).',
+      );
+    }
 
     if (activate) await this._retireOthers(kind, name, version);
     if (this.logger) this.logger.info({ kind, version, msg: 'kasaya sır yazıldı' });
@@ -186,7 +218,7 @@ class KeyVault {
     if (row.status === STATUS.COMPROMISED) {
       throw new Error(`[vault] sır ele geçmiş olarak işaretli: ${kind}/${name} v${row.version}`);
     }
-    const value = this._unwrap(row.ciphertext, KeyVault.aadFor(row.kind, row.name, Number(row.version)), row.wrapKeyId);
+    const value = this._unwrap(envelopeOf(row), KeyVault.aadFor(row.kind, row.name, Number(row.version)), row.wrapKeyId);
     return {
       id: String(row._id),
       kind: row.kind,
@@ -212,7 +244,7 @@ class KeyVault {
         out.push({
           version: Number(row.version),
           status: row.status,
-          value: this._unwrap(row.ciphertext, KeyVault.aadFor(row.kind, row.name, Number(row.version)), row.wrapKeyId),
+          value: this._unwrap(envelopeOf(row), KeyVault.aadFor(row.kind, row.name, Number(row.version)), row.wrapKeyId),
           createdAt: Number(row.createdAt || 0),
         });
       } catch (err) {
@@ -294,13 +326,15 @@ class KeyVault {
     for await (const row of this.collection.scan()) {
       if (row.wrapKeyId === nextKeyId) continue;
       const aad = KeyVault.aadFor(row.kind, row.name, Number(row.version));
-      const plaintext = this._unwrap(row.ciphertext, aad, row.wrapKeyId);
+      const plaintext = this._unwrap(envelopeOf(row), aad, row.wrapKeyId);
       const iv = crypto.randomBytes(12);
       const cipher = crypto.createCipheriv('aes-256-gcm', nextKey, iv);
       cipher.setAAD(Buffer.from(aad, 'utf8'));
       const ct = Buffer.concat([cipher.update(plaintext), cipher.final()]);
+      const rewrappedEnvelope = Buffer.concat([iv, cipher.getAuthTag(), ct]);
       await this.collection.update(String(row._id), {
-        ciphertext: Buffer.concat([iv, cipher.getAuthTag(), ct]),
+        ciphertext: rewrappedEnvelope,
+        ciphertextB64: rewrappedEnvelope.toString('base64'),
         wrapKeyId: nextKeyId,
         rotatedAt: Date.now(),
       });
@@ -310,6 +344,65 @@ class KeyVault {
     this.wrapKeyId = nextKeyId;
     return { rewrapped, unchanged: false };
   }
+}
+
+/**
+ * Sürücüden dönen "bayt" alanını Buffer'a çevirir.
+ *
+ * ── BİLDİRİLEN HATA ────────────────────────────────────────────────────
+ * Uzak (gRPC) sürücüde bir DKIM anahtarı yazıldıktan MİLİSANİYELER sonra
+ * okunduğunda "Unsupported state or unable to authenticate data" veriyordu.
+ * Anahtar doğru, veri sağlam, AAD aynı — değişen tek şey zarfın TÜRÜYDÜ.
+ * Şema alanı `bytes` diyor ama tel üzerinde bayt taşımanın tek bir yolu yok:
+ * gömülü motor Buffer, gRPC/JSON köprüsü base64 dizgesi, bir başkası
+ * `{type:'Buffer',data:[…]}` döndürebiliyor.
+ *
+ * Eski kod `Buffer.isBuffer(x) ? x : Buffer.from(x)` diyordu. `Buffer.from`
+ * bir DİZGEYE UTF-8 uygular: base64 metni bayta çevrilmiyor, harfleri
+ * kodlanıyor. Ortaya çıkan zarf hem daha uzun hem tamamen farklı; GCM haklı
+ * olarak reddediyor ve hata "veri bozulmuş" gibi okunuyor.
+ *
+ * Buradaki çözüm iki yönlü: okurken bilinen bütün temsiller kabul ediliyor,
+ * yazarken (bkz. `put`) zarf base64 DİZGE olarak da saklanıyor — dizgeyi
+ * hiçbir taşıma katmanı bozmuyor.
+ */
+function toBytes(value) {
+  if (value == null) return null;
+  if (Buffer.isBuffer(value)) return value;
+  if (value instanceof Uint8Array) return Buffer.from(value.buffer, value.byteOffset, value.byteLength);
+  if (value instanceof ArrayBuffer) return Buffer.from(value);
+  if (Array.isArray(value)) return Buffer.from(value);
+  // JSON turundan geçmiş Buffer: { type: 'Buffer', data: [...] }
+  if (typeof value === 'object' && value.type === 'Buffer' && Array.isArray(value.data)) {
+    return Buffer.from(value.data);
+  }
+  if (typeof value === 'string') {
+    // Dizge geldiyse hangi kodlamada olduğunu İÇERİĞİNDEN anlıyoruz.
+    // Tahmin etmek yerine geri-çevirip karşılaştırıyoruz: yanlış kodlama
+    // sessizce farklı baytlar üretir ve hata çok sonra, imza doğrulanırken
+    // ortaya çıkar.
+    const compact = value.replace(/\s+/g, '');
+    if (/^[A-Fa-f0-9]+$/.test(compact) && compact.length % 2 === 0) {
+      const hex = Buffer.from(compact, 'hex');
+      if (hex.toString('hex') === compact.toLowerCase()) return hex;
+    }
+    if (/^[A-Za-z0-9+/=_-]+$/.test(compact)) {
+      const b64 = Buffer.from(compact, 'base64');
+      if (b64.length) return b64;
+    }
+    return Buffer.from(value, 'latin1');
+  }
+  return null;
+}
+
+/**
+ * Kayıttaki zarfı seçer: base64 dizge varsa O tercih edilir.
+ *
+ * Eski kayıtlarda yalnızca `ciphertext` var; ikisini de denemek, kasayı
+ * baştan kurmayı gerektirmeden geçişi mümkün kılıyor.
+ */
+function envelopeOf(row) {
+  return row.ciphertextB64 || row.ciphertext;
 }
 
 function safeParse(s) { try { return JSON.parse(s); } catch { return null; } }

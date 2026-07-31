@@ -7,39 +7,46 @@ const { HttpError } = require('../router');
  *
  * Microsoft OAuth'un yerini alan kısım. Akış tarayıcıda şöyle görünüyor:
  *
- *   /giris          -> IdP'ye yönlendirme (PKCE ile)
- *   /oauth/callback -> kod jetona çevrilir, oturum çerezi konur
- *   /cikis          -> yerel oturum ve (istenirse) IdP oturumu kapatılır
+ *   /login                 -> IdP'ye yönlendirme (PKCE ile)
+ *   /oauth/callback        -> kod jetona çevrilir, oturum çerezi konur
+ *   /oauth/upgrade-scope   -> eksik bir kapsam için tek turluk onay
+ *   /logout                -> yerel oturum ve (istenirse) IdP oturumu kapatılır
+ *
+ * Türkçe adlar (/giris, /cikis, /yetki-yukselt) eski bağlantılar için
+ * yönlendirme olarak duruyor.
  */
 function registerAuthRoutes(router, deps) {
   const { config, logger, sessions, stores } = deps;
 
   /**
-   * Giriş.
+   * Yollar ve parametreler İNGİLİZCE.
    *
-   * İki yol da kayıtlı: `/giris` arayüzün kullandığı ad, `/login` ise
-   * belgelerde ve hata sayfalarında geçen ad. Önceki sürümde YALNIZCA
-   * `/login` kayıtlıydı; arayüzdeki "Fitfak Kimlik ile giriş yap" düğmesi
-   * `/giris`e gidiyordu ve o yol, tek sayfa uygulamasının "bulunamadı"
-   * yakalayıcısına düşüp aynı sayfayı geri veriyordu. Yani düğme hiçbir şey
-   * yapmıyor gibi görünüyordu — istek başarılı, sayfa aynı.
+   * Kod tabanının geri kalanı (değişkenler, alan adları, API yolları) zaten
+   * İngilizce; yalnızca oturum yolları Türkçeydi ve bu iki soruna yol
+   * açıyordu. Birincisi tutarsızlık: `/giris` ile `/api/v1/messages` aynı
+   * uygulamada. İkincisi ve asıl olanı, arayüzün `/giris`e bağlanıp
+   * sunucunun yalnızca `/login`i tanıması — düğme, tek sayfa yakalayıcısına
+   * düşüp aynı sayfayı geri veriyordu.
+   *
+   * Türkçe adlar KALDIRILMADI, kalıcı yönlendirmeye çevrildi: yer imleri ve
+   * dışarıdaki bağlantılar (kişisel sitedeki düğmeler dâhil) kırılmasın.
    */
   const beginLogin = async (ctx) => {
     const sid = ctx.cookies()[config.http.sessionCookieName];
     if (sid) {
       const existing = await sessions.authenticate({ sid, ip: ctx.ip });
-      if (existing) { ctx.redirect(safePath(ctx.query.get('donus')) || '/'); return; }
+      if (existing) { ctx.redirect(safePath(returnToOf(ctx)) || '/'); return; }
     }
     const begin = await sessions.beginLogin({
       ip: ctx.ip,
       userAgent: ctx.header('user-agent') || '',
-      returnTo: ctx.query.get('donus') || ctx.query.get('return_to') || '/',
-      loginHint: ctx.query.get('eposta') || ctx.query.get('login_hint') || null,
+      returnTo: returnToOf(ctx) || '/',
+      loginHint: ctx.query.get('login_hint') || ctx.query.get('eposta') || null,
     });
     ctx.redirect(begin.url);
   };
   router.get('/login', beginLogin);
-  router.get('/giris', beginLogin);
+  router.get('/giris', (ctx) => ctx.redirect(`/login${ctx.url.search || ''}`));
 
   router.get(config.idp.redirectPath, async (ctx) => {
     const error = ctx.query.get('error');
@@ -101,14 +108,13 @@ function registerAuthRoutes(router, deps) {
 
   const doLogout = async (ctx) => {
     const sid = ctx.cookies()[config.http.sessionCookieName];
-    if (sid) {
-      await sessions.logout({ sid, revokeIdpSessions: ctx.query.get('hepsi') === '1' }).catch(() => {});
-    }
+    const all = ctx.query.get('all') === '1' || ctx.query.get('hepsi') === '1';
+    if (sid) await sessions.logout({ sid, revokeIdpSessions: all }).catch(() => {});
     ctx.clearCookie(config.http.sessionCookieName);
     ctx.redirect('/');
   };
   router.get('/logout', doLogout);
-  router.get('/cikis', doLogout);
+  router.get('/cikis', (ctx) => ctx.redirect(`/logout${ctx.url.search || ''}`));
 
   /**
    * Kapsam yükseltme başlatıcı.
@@ -118,25 +124,24 @@ function registerAuthRoutes(router, deps) {
    * Kullanıcıyı giriş ekranına atmak yerine yalnızca EKSİK olan için onay
    * istiyoruz; dönüşte aynı oturum devam eder.
    */
-  router.get('/yetki-yukselt', async (ctx) => {
+  const upgradeScope = async (ctx) => {
     const sid = ctx.cookies()[config.http.sessionCookieName];
     const session = sid ? await sessions.authenticate({ sid, ip: ctx.ip }) : null;
-    if (!session) { ctx.redirect(`/giris?donus=${encodeURIComponent(ctx.query.get('donus') || '/')}`); return; }
+    const returnTo = returnToOf(ctx) || '/';
+    if (!session) { ctx.redirect(`/login?return_to=${encodeURIComponent(returnTo)}`); return; }
 
-    const scope = String(ctx.query.get('kapsam') || config.trust.issueScope);
+    const scope = String(ctx.query.get('scope') || ctx.query.get('kapsam') || config.trust.issueScope);
     const allowed = new Set([...config.idp.scopes, config.trust.issueScope]);
     if (!allowed.has(scope)) throw new HttpError(400, 'Bilinmeyen kapsam');
 
     const begin = await sessions.beginScopeUpgrade({
-      session,
-      scope,
-      returnTo: ctx.query.get('donus') || '/',
-      ip: ctx.ip,
-      userAgent: ctx.header('user-agent') || '',
+      session, scope, returnTo, ip: ctx.ip, userAgent: ctx.header('user-agent') || '',
     });
     logger.info({ email: session.idpEmail, scope, msg: 'kapsam yükseltme başlatıldı' });
     ctx.redirect(begin.url);
-  });
+  };
+  router.get('/oauth/upgrade-scope', upgradeScope);
+  router.get('/yetki-yukselt', (ctx) => ctx.redirect(`/oauth/upgrade-scope${ctx.url.search || ''}`));
 
   router.post('/logout', async (ctx) => {
     const sid = ctx.cookies()[config.http.sessionCookieName];
@@ -186,6 +191,11 @@ function registerAuthRoutes(router, deps) {
   });
 }
 
+/** `return_to` — Türkçe `donus` eski bağlantılar için kabul edilmeye devam eder. */
+function returnToOf(ctx) {
+  return ctx.query.get('return_to') || ctx.query.get('donus') || '';
+}
+
 function safePath(value) {
   const s = String(value || '');
   if (!s.startsWith('/') || s.startsWith('//')) return null;
@@ -196,7 +206,7 @@ function errorPage(title, detail) {
   return page(title, `
     <h1>${escapeHtml(title)}</h1>
     <p>${escapeHtml(detail)}</p>
-    <p><a class="btn" href="/giris">Tekrar dene</a></p>
+    <p><a class="btn" href="/login">Tekrar dene</a></p>
   `);
 }
 
@@ -208,7 +218,7 @@ function noMailboxPage(reason, config) {
     ${info.action ? `<p>${escapeHtml(info.action)}</p>` : ''}
     <p>Yönetici ile iletişim:
       <a href="mailto:network@${escapeHtml(config.primaryDomain)}">network@${escapeHtml(config.primaryDomain)}</a></p>
-    <p><a class="btn" href="/cikis">Çıkış yap</a></p>
+    <p><a class="btn" href="/logout">Çıkış yap</a></p>
   `);
 }
 
