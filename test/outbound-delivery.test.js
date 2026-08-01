@@ -167,6 +167,32 @@ for (const driver of ['file', 'fitfak']) {
     }
   });
 
+  runner.test(`[${driver}] ham ileti gövdesi blob turundan birebir geçer`, async () => {
+    const ctx = await createContext({ driver, liveQueue: true });
+    try {
+      // Çok parçalı olsun diye parça boyutundan büyük: kuyruğa alınan ham
+      // ileti okunamazsa teslimat "ham ileti bulunamadı" ile ölür ve posta
+      // hiç gitmez — uzak sürücüde tam olarak bu oluyordu.
+      const raw = Buffer.concat([
+        Buffer.from('Subject: buyuk ileti\r\nMessage-ID: <blob-1@fitfak.net>\r\n\r\n', 'utf8'),
+        require('node:crypto').randomBytes(700 * 1024),
+      ]);
+
+      const result = await ctx.stores.outbound.enqueue({
+        rawBuffer: raw,
+        envelopeFrom: 'network@fitfak.net',
+        recipients: ['blob@example.com'],
+      });
+
+      const row = await ctx.stores.outbound.byQueueId(result.queued[0]);
+      const readBack = await ctx.stores.outbound.getRaw(row);
+
+      assert(readBack, 'kuyruğa alınan ham ileti geri okunabilmeli');
+      assertEqual(readBack.length, raw.length, 'uzunluk birebir olmalı');
+      assert(readBack.equals(raw), 'baytlar birebir olmalı');
+    } finally { await ctx.close(); }
+  });
+
   runner.test(`[${driver}] eşzamanlı turlar iletiyi iki kez teslim etmez`, async () => {
     const mxPort = await freePort();
     const mx = await startFakeMx({ port: mxPort });

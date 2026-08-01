@@ -50,8 +50,48 @@ function hasChunkPrefix(buf) {
     && buf.subarray(0, CHUNK_PREFIX_BYTES.length).equals(CHUNK_PREFIX_BYTES);
 }
 
+/**
+ * Sürücüden gelen parça değerini baytlara indirger — İKİ olası temsili de
+ * deneyerek ve TAHMİN ETMEDEN.
+ *
+ * `bytes` alanı geri okunduğunda üç şekilde gelebiliyor:
+ *   Buffer                    (gömülü motor)
+ *   base64 dizge              (JSON köprüsü / gRPC yanıtı)
+ *   latin1 içerik dizgesi     (parçayı dizge olarak yazan eski sürüm)
+ *
+ * Ön ek burada karar mekanizması olarak çalışıyor: değeri doğrudan bayta
+ * çevirdiğimizde `b64:` görüyorsak iş bitmiştir; görmüyorsak ve değer bir
+ * dizgeyse, onu base64 çözüp bir daha bakarız. İki denemeden hangisi ön eki
+ * taşıyorsa doğru yorum odur — belirsizlik yok, olasılık yok.
+ */
+function resolveChunkBytes(value) {
+  const direct = toBuffer(value);
+  if (hasChunkPrefix(direct)) return direct;
+  if (typeof value === 'string') {
+    const decoded = tryDecodeBase64(Buffer.from(value, 'latin1'));
+    if (decoded && hasChunkPrefix(decoded)) return decoded;
+  }
+  return direct;
+}
+
+/**
+ * Parçayı `bytes` alanına YAZILACAK biçimde kodlar — ve BUFFER döndürür.
+ *
+ * Dizge döndürmek, düzeltmeye çalıştığı hatanın ta kendisini üretiyordu.
+ * `blob_chunks.bytes` şemada `bytes` türünde; gRPC sürücüsünün kodlayıcısı bu
+ * alana gelen bir DİZGEYİ base64 sanıp çözüyor. Değer `b64:AAAA…` olduğu için
+ * çözüm hem ön eki hem gövdeyi bozuyor: `:` geçerli bir base64 karakteri
+ * değil, çözücü onu sessizce atıyor ve geriye ne ön ek ne de özgün baytlar
+ * kalıyor. Sonuç, uzak (mTLS/gRPC) sürücüde HER ekin ve HER giden iletinin
+ * ham gövdesinin okunamaz olmasıydı — "parça uzunlukları üstbilgiyle
+ * uyuşmuyor" hatası buradan geliyordu ve postanın hiç gönderilememesi demekti.
+ *
+ * Buffer olarak yazıldığında kodlayıcı ona dokunmuyor; `b64:` ön eki de
+ * verinin İÇİNDE, bayt olarak duruyor ve okuma tarafı hangi sürücüden geçtiğine
+ * bakmadan onu tanıyor — ön ekin var oluş amacı zaten buydu.
+ */
 function encodeChunk(slice) {
-  return CHUNK_PREFIX + slice.toString('base64');
+  return Buffer.from(CHUNK_PREFIX + slice.toString('base64'), 'latin1');
 }
 
 class BlobStore {
@@ -143,7 +183,7 @@ class BlobStore {
     }
     rows.sort((a, b) => Number(a.seq) - Number(b.seq));
 
-    const rawValues = rows.map((r) => toBuffer(r.bytes));
+    const rawValues = rows.map((r) => resolveChunkBytes(r.bytes));
 
     // 1. Kendini tanıtan parçalar: doğrudan çöz.
     if (rawValues.every(hasChunkPrefix)) {
@@ -280,4 +320,4 @@ class BlobStore {
   }
 }
 
-module.exports = { BlobStore, CHUNK_PREFIX };
+module.exports = { BlobStore, CHUNK_PREFIX, encodeChunk, hasChunkPrefix };

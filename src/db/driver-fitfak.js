@@ -90,6 +90,38 @@ class FitfakCollection {
     this.schema = schema;
     this.hub = hub;
     this.fields = new Map((schema.fields || []).map((f) => [f.name, f]));
+    this.byteFields = [...this.fields.values()].filter((f) => f.type === 'bytes').map((f) => f.name);
+  }
+
+  /**
+   * `bytes` alanlarını sürücüden bağımsız olarak Buffer'a indirger.
+   *
+   * Gömülü motor bir `bytes` alanını Buffer olarak geri veriyor; uzak (gRPC)
+   * sürücü ise kaydı JSON üzerinden taşıdığı için BASE64 DİZGE olarak veriyor
+   * — JSON'da bayt diye bir tür yok. Üst katmanlar bu farkı görmemeli ve
+   * görmediklerinde de sessizce yanlış davranıyorlardı: blob parçaları uzak
+   * sürücüde base64 metni olarak okunuyor, `toBuffer` onları (doğru biçimde,
+   * çünkü tahmin etmeyi reddediyor) latin1 içerik sayıyor ve parça
+   * uzunlukları üstbilgiyle tutmuyordu.
+   *
+   * Buradaki çözüm, motorun JSON kodlamasının TAM TERSİ: alan şemada `bytes`
+   * ise ve değer dizge olarak geldiyse, base64 çözülür. Tahmin yok — kararı
+   * şema veriyor.
+   */
+  _decode(record) {
+    if (!record || !this.byteFields.length) return record;
+    let out = record;
+    for (const name of this.byteFields) {
+      const value = record[name];
+      if (typeof value !== 'string') continue;
+      if (out === record) out = { ...record };
+      out[name] = Buffer.from(value, 'base64');
+    }
+    return out;
+  }
+
+  _decodeAll(rows) {
+    return Array.isArray(rows) ? rows.map((r) => this._decode(r)) : [];
   }
 
   async insert(record) {
@@ -114,8 +146,8 @@ class FitfakCollection {
   }
 
   async get(id) {
-    if (typeof this.inner.get === 'function') return this.inner.get(String(id));
-    return this.inner.findOne('_id', String(id));
+    if (typeof this.inner.get === 'function') return this._decode(await this.inner.get(String(id)));
+    return this._decode(await this.inner.findOne('_id', String(id)));
   }
 
   async getWithVersion(id) {
@@ -128,12 +160,12 @@ class FitfakCollection {
 
   async find(field, value, { limit = 0 } = {}) {
     const out = await this.inner.find(field, value);
-    const list = Array.isArray(out) ? out : [];
+    const list = this._decodeAll(out);
     return limit ? list.slice(0, limit) : list;
   }
 
   async findOne(field, value) {
-    if (typeof this.inner.findOne === 'function') return this.inner.findOne(field, value);
+    if (typeof this.inner.findOne === 'function') return this._decode(await this.inner.findOne(field, value));
     const list = await this.find(field, value, { limit: 1 });
     return list[0] || null;
   }
@@ -148,14 +180,14 @@ class FitfakCollection {
   // range ("everything due by now") is the whole collection on every poll.
   async findRange(field, min, max, { limit = 0 } = {}) {
     const out = await this.inner.findRange(field, min, max, { limit });
-    const list = Array.isArray(out) ? out : [];
+    const list = this._decodeAll(out);
     return limit ? list.slice(0, limit) : list;
   }
 
   async *scan(opts = {}) {
     let count = 0;
     for await (const rec of this.inner.scan(opts)) {
-      yield rec;
+      yield this._decode(rec);
       if (opts.limit && ++count >= opts.limit) return;
     }
   }
