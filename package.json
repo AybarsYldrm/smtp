@@ -32,7 +32,7 @@
     "test": "node test/run-all.js",
     "test:crypto": "node test/run-all.js crypto",
     "test:mail": "node test/run-all.js mime smtp-e2e",
-    "test:db": "node test/run-all.js storage",
+    "test:db": "node test/run-all.js storage driver-shapes",
     "test:http": "node test/run-all.js http-api auth-identity"
   },
   "peerDependencies": {

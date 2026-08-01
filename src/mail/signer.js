@@ -31,6 +31,50 @@ class MailSigner {
    * göndermektir — ve imzasız gönderilen ilk postalar alan adının itibarını
    * en kırılgan olduğu anda zedeler.
    */
+  /**
+   * Yeni bir DKIM anahtarı üretip kasaya yazar ve geri okur.
+   * Kasa yazması doğrulanır: yazılamayan bir anahtarla dönmek, çağıranın
+   * `null.value` üzerinde patlaması demekti.
+   */
+  async _createDkimKey(domain, selector, name) {
+    const generated = dkim.generateKeyPair({ algorithm: 'rsa', modulusLength: 2048 });
+    const dnsRecord = dkim.dnsRecordValue(generated);
+    await this.vault.put({
+      kind: 'dkim-key',
+      name,
+      value: generated.privateKeyPem,
+      contentType: 'application/x-pem-file',
+      meta: { domain, selector, algorithm: generated.algorithm, dnsRecord },
+    });
+    const secret = await this.vault.get('dkim-key', name);
+    if (!secret) {
+      throw new Error(`[signer] DKIM anahtarı kasaya yazıldı ama geri okunamadı: ${domain}`);
+    }
+    this.logger.warn({
+      domain,
+      selector,
+      dnsName: `${selector}._domainkey.${domain}`,
+      dnsValue: dnsRecord,
+      msg: 'DKIM anahtarı üretildi — bu TXT kaydı yayımlanana kadar imzalar doğrulanamaz',
+    });
+    return secret;
+  }
+
+  /**
+   * Alan adının DKIM anahtarını döndürür; yoksa ÜRETİR.
+   *
+   * ── AÇILAMAYAN ANAHTAR ───────────────────────────────────────────────
+   * Kasadaki anahtar açılamıyorsa (kasa sırrı değişmiş, kayıt bozulmuş)
+   * eskiden buradan bir istisna çıkıyor ve GİDEN HER POSTA 500 ile
+   * düşüyordu — imzalanamayan bir anahtar yüzünden hiç posta gitmiyordu.
+   *
+   * Açılamayan bir anahtar zaten KULLANILAMAZ: onunla imza atılamaz,
+   * doğrulanamaz, döndürülemez. Onu tutmanın tek etkisi, postayı
+   * durdurmaktır. Bu yüzden kayıt "ele geçmiş" olarak işaretlenip yerine
+   * yenisi üretiliyor ve durum GÜRÜLTÜLÜ biçimde kayda geçiyor: DNS'teki
+   * TXT kaydının güncellenmesi gerekiyor ve bu yapılana kadar imzalar
+   * doğrulanmayacak.
+   */
   async getDkimKey(domain) {
     const domainConfig = this.config.domainConfig(domain);
     if (!domainConfig) return null;
@@ -40,30 +84,19 @@ class MailSigner {
     if (cached && Date.now() - cached.at < this.cacheTtlMs) return cached;
 
     const name = MailSigner.dkimSecretName(domain, selector);
-    let secret = await this.vault.get('dkim-key', name);
-
-    if (!secret) {
-      const generated = dkim.generateKeyPair({ algorithm: 'rsa', modulusLength: 2048 });
-      await this.vault.put({
-        kind: 'dkim-key',
-        name,
-        value: generated.privateKeyPem,
-        contentType: 'application/x-pem-file',
-        meta: {
-          domain,
-          selector,
-          algorithm: generated.algorithm,
-          dnsRecord: dkim.dnsRecordValue(generated),
-        },
-      });
+    let secret = null;
+    try {
       secret = await this.vault.get('dkim-key', name);
-      this.logger.warn({
-        domain,
-        selector,
-        dnsName: `${selector}._domainkey.${domain}`,
-        msg: 'DKIM anahtarı üretildi — DNS TXT kaydı yayımlanana kadar imzalar doğrulanamaz',
+    } catch (err) {
+      this.logger.error({
+        domain, selector, code: err.code, error: err.message,
+        msg: 'kasadaki DKIM anahtarı açılamadı — yerine yenisi üretiliyor, DNS kaydı GÜNCELLENMELİ',
       });
+      await this._retireUnreadableDkimKey(name, err.message);
+      secret = null;
     }
+
+    if (!secret) secret = await this._createDkimKey(domain, selector, name);
 
     const privateKeyPem = secret.value.toString('utf8');
     const entry = {
@@ -76,6 +109,19 @@ class MailSigner {
     };
     this.dkimCache.set(domain, entry);
     return entry;
+  }
+
+  /** Açılamayan sürümleri işaretler; `get` bir daha onlara dönmesin. */
+  async _retireUnreadableDkimKey(name, reason) {
+    try {
+      const rows = (await this.vault.collection.find('name', name))
+        .filter((r) => r.kind === 'dkim-key' && r.status !== 'compromised');
+      for (const row of rows) {
+        await this.vault.markCompromised('dkim-key', name, Number(row.version), `unreadable: ${reason}`);
+      }
+    } catch (err) {
+      this.logger.warn({ error: err.message, msg: 'açılamayan DKIM anahtarı işaretlenemedi' });
+    }
   }
 
   /** Yayımlanması gereken DNS kaydı — durum API'si ve DNS denetimi kullanır. */
@@ -97,7 +143,19 @@ class MailSigner {
     const signingDomain = domain || String(fromAddress || '').split('@')[1];
     if (!signingDomain) return { rawMessage, signed: false, reason: 'alan adı belirlenemedi' };
 
-    const key = await this.getDkimKey(signingDomain);
+    let key;
+    try {
+      key = await this.getDkimKey(signingDomain);
+    } catch (err) {
+      // Anahtar alınamadı (kasa erişilemiyor ya da yazılamıyor). İMZASIZ
+      // GÖNDERMEK, HİÇ GÖNDERMEMEKTEN İYİDİR: kendi alan adımızdan çıkan
+      // posta SPF ile zaten hizalı ve DMARC'ı geçebilir. Ama sessiz kalmaz.
+      this.logger.error({
+        domain: signingDomain, code: err.code, error: err.message,
+        msg: 'DKIM anahtarı alınamadı — ileti İMZASIZ gönderiliyor',
+      });
+      return { rawMessage, signed: false, reason: `DKIM anahtarı alınamadı: ${err.message}` };
+    }
     if (!key) {
       // Bizim olmayan bir alan adına DKIM imzası atmak mümkün değil (anahtar
       // yok) ve atmaya çalışmak yanlış: imza atılamadı bilgisi kayda yazılır.

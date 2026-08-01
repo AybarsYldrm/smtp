@@ -1,5 +1,7 @@
 'use strict';
 
+const crypto = require('node:crypto');
+
 const { HttpError } = require('../router');
 const { normalizeAddress, safeFileName, htmlEscape } = require('../../util/encoding');
 const { signHs, verifyHs } = require('../../util/jwt');
@@ -308,27 +310,44 @@ function registerWebmailRoutes(router, deps) {
       'accept-ranges': 'bytes',
     };
 
+    // Baytlar akıtılırken İKİ şey garanti edilmeli, yoksa ek bozuk iner:
+    //   - yazılan her parça gerçekten Buffer olmalı (bir dizge yazmak,
+    //     `content-length` bayt cinsinden hesaplandığı için gövdeyi kesik
+    //     bırakır),
+    //   - `write()` false döndüğünde 'drain' beklenmeli; beklemezsek büyük
+    //     ekler süreç belleğinde birikir.
+    const streamTo = async (statusCode, extraHeaders, readOptions) => {
+      ctx.responded = true;
+      ctx.res.writeHead(statusCode, extraHeaders);
+      let written = 0;
+      for await (const chunk of stores.blobs.readStream(attachment.blobId, readOptions)) {
+        const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+        written += buf.length;
+        if (!ctx.res.write(buf)) {
+          await new Promise((resolve) => ctx.res.once('drain', resolve));
+        }
+      }
+      ctx.res.end();
+      const expected = Number(extraHeaders['content-length']);
+      if (Number.isFinite(expected) && written !== expected) {
+        // Gövde ile başlık çeliştiyse istemci sessizce kesik dosya alır.
+        // Bağlantı zaten yazıldı; yapılabilecek tek şey bunu görünür kılmak.
+        logger.error({
+          attachment: attachment.ref, blobId: attachment.blobId, expected, written,
+          msg: 'ek gövdesi bildirilen uzunlukla eşleşmedi',
+        });
+      }
+    };
+
     if (range) {
       headers['content-range'] = `bytes ${range.start}-${range.end}/${meta.totalBytes}`;
       headers['content-length'] = range.end - range.start + 1;
-      ctx.responded = true;
-      ctx.res.writeHead(206, headers);
-      
-      for await (const chunk of stores.blobs.readStream(attachment.blobId, range)) {
-        ctx.res.write(chunk);
-      }
-      ctx.res.end();
+      await streamTo(206, headers, range);
       return;
     }
 
     headers['content-length'] = meta.totalBytes;
-    ctx.responded = true;
-    ctx.res.writeHead(200, headers);
-    
-    for await (const chunk of stores.blobs.readStream(attachment.blobId)) {
-        ctx.res.write(chunk);
-    }
-    ctx.res.end();
+    await streamTo(200, headers, {});
   });
 
   /* ── ileti durumu ──────────────────────────────────────────── */
@@ -708,14 +727,19 @@ function registerWebmailRoutes(router, deps) {
     });
 
     if (!delegated.ok) {
-      // 2. Kapsam (scope) eksikse arayüze 409 dönüp /yetki-yukselt adresi veriliyor:
+      // Kapsam eksikse arayüz kullanıcıyı onay turuna götürsün diye 409 ve
+      // ADRES döner. Adres İNGİLİZCE: yollar ve parametreler bir sözleşmedir,
+      // belgelerde ve istemcilerde geçerler.
       const returnTo = String(ctx.state.input.fields.returnTo || '/');
       throw new HttpError(409, delegated.message, {
         code: delegated.code === 'scope_required' ? 'CERT_SCOPE_REQUIRED' : 'IDP_REAUTH_REQUIRED',
         detail: {
           requiredScope: config.trust.issueScope,
-          authorizeUrl: `/yetki-yukselt?kapsam=${encodeURIComponent(config.trust.issueScope)}`
-            + `&donus=${encodeURIComponent(returnTo)}`,
+          grantedScopes: delegated.grantedScopes || [],
+          // Onayın AYNI hesapla verilmesi gerektiği arayüzde söylenebilsin.
+          approveAs: session.idpEmail,
+          authorizeUrl: `/authorize-scope?scope=${encodeURIComponent(config.trust.issueScope)}`
+            + `&return_to=${encodeURIComponent(returnTo)}`,
         },
       });
     }
@@ -768,6 +792,138 @@ function registerWebmailRoutes(router, deps) {
     } catch (err) {
       throw new HttpError(err.status || 400, err.message, { code: 'CERT_REGISTER_FAILED' });
     }
+  });
+
+  /* ── .pfx (PKCS#12) dışa/içe aktarma ───────────────────────── */
+
+  /**
+   * S/MIME sertifikasını ve özel anahtarını .pfx olarak indirir.
+   *
+   * Bu, özel anahtarın sunucudan ÇIKTIĞI tek yol ve bilinçli olarak zor:
+   *   - `owner` yetkisi ve CSRF gerekli,
+   *   - POST (GET olsaydı bir bağlantı tıklaması yeterdi),
+   *   - en az 8 karakterlik bir parola ZORUNLU — parolasız bir .pfx,
+   *     indirmeler klasöründe duran düz metin bir özel anahtardır,
+   *   - denetim kaydına yazılır: bir anahtarın dışarı çıktığı, sonradan
+   *     mutlaka sorulacak bir sorudur.
+   *
+   * Dosya Thunderbird, Outlook, Apple Mail ve iOS/Android profillerinde
+   * doğrudan içe aktarılabilir.
+   */
+  router.post('/api/v1/mailboxes/:mailbox/certificate/export', async (ctx) => {
+    const session = await requireSession(ctx);
+    ctx.state.input = await ctx.input();
+    requireCsrf(ctx, session);
+    const { mailbox } = await resolveMailbox(ctx, session, ctx.params.mailbox, 'owner');
+
+    const password = String(ctx.state.input.fields.password || '');
+    if (password.length < 8) {
+      throw new HttpError(400, 'En az 8 karakterlik bir dosya parolası gerekiyor', {
+        code: 'PFX_PASSWORD_REQUIRED',
+      });
+    }
+
+    const pair = await stores.certificates.getSigningPair('smime', mailbox.address);
+    if (!pair) {
+      throw new HttpError(404, `${mailbox.address} için özel anahtarı sunucuda olan bir S/MIME sertifikası yok`, {
+        code: 'NO_EXPORTABLE_CERT',
+      });
+    }
+
+    const { PKCS12 } = require('../../certs/pkcs12');
+    const chain = pair.chainPem ? splitPemChain(pair.chainPem) : [];
+    const pfx = new PKCS12(password).build(pair.certPem, pair.privateKeyPem, {
+      friendlyName: `${mailbox.displayName || mailbox.address} (S/MIME)`,
+      chainPem: chain,
+    });
+
+    await stores.audit.record({
+      actorSub: session.idpSub, actorEmail: session.idpEmail,
+      action: 'certificate.export_pfx', targetType: 'mailbox', targetId: mailbox.ref, ip: ctx.ip,
+      detail: { serialHex: pair.serialHex, chainLength: chain.length },
+    });
+    logger.warn({
+      mailbox: mailbox.address, actor: session.idpEmail, serialHex: pair.serialHex,
+      msg: 'S/MIME özel anahtarı .pfx olarak dışa aktarıldı',
+    });
+
+    const fileName = safeFileName(`${mailbox.address.replace('@', '-at-')}.pfx`);
+    ctx.setHeader('content-disposition', `attachment; filename="${fileName}"`);
+    ctx.setHeader('cache-control', 'no-store');
+    ctx.send(200, pfx, 'application/x-pkcs12');
+  });
+
+  /**
+   * Dışarıda üretilmiş bir anahtar/sertifika çiftini .pfx'ten içeri alır.
+   *
+   * Sertifikanın gerçekten bu kutuya ait olduğu ve anahtarın gerçekten o
+   * sertifikaya ait olduğu DOĞRULANIR. İkisi de şart:
+   *   - adres denetimi olmadan, herhangi bir sertifika bir kutuya
+   *     bağlanabilir ve o kutunun adına imza atılmış gibi görünürdü,
+   *   - eşleşme denetimi olmadan, anahtarla sertifika uyuşmayan bir çift
+   *     saklanır ve hata ancak ilk imzalamada, çok daha geç görülürdü.
+   */
+  router.post('/api/v1/mailboxes/:mailbox/certificate/import', async (ctx) => {
+    const session = await requireSession(ctx);
+    ctx.state.input = await ctx.input();
+    requireCsrf(ctx, session);
+    const { mailbox } = await resolveMailbox(ctx, session, ctx.params.mailbox, 'owner');
+
+    const { fields, files } = ctx.state.input;
+    const uploaded = (files || [])[0];
+    const pfxBytes = uploaded
+      ? uploaded.content
+      : (fields.pfx ? decodeDeclaredContent({ content: fields.pfx, encoding: 'base64', fileName: 'pfx' }) : null);
+    if (!pfxBytes || !pfxBytes.length) {
+      throw new HttpError(400, 'Bir .pfx dosyası gerekiyor', { code: 'PFX_MISSING' });
+    }
+
+    const { PKCS12 } = require('../../certs/pkcs12');
+    let parsed;
+    try {
+      parsed = new PKCS12(String(fields.password || '')).parse(pfxBytes);
+    } catch (err) {
+      throw new HttpError(400, err.message, { code: 'PFX_UNREADABLE' });
+    }
+    if (!parsed.certificates.length || !parsed.privateKeys.length) {
+      throw new HttpError(400, 'Dosyada sertifika ve özel anahtar birlikte bulunmalı', {
+        code: 'PFX_INCOMPLETE',
+      });
+    }
+
+    const verdict = matchCertificateToMailbox(parsed, mailbox.address);
+    if (!verdict.ok) throw new HttpError(400, verdict.reason, { code: verdict.code });
+
+    const stored = await stores.certificates.store({
+      usage: 'smime',
+      subjectAddress: mailbox.address,
+      mailboxRef: mailbox.ref,
+      certPem: verdict.certPem,
+      chainPem: verdict.chainPem,
+      privateKeyPem: verdict.privateKeyPem,
+      issuedVia: 'pfx-import',
+      requestedBySub: session.idpSub,
+      renewAtRatio: config.trust.renewAtLifetimeRatio,
+    });
+    if (signer) signer.invalidate(mailbox.address);
+
+    await stores.audit.record({
+      actorSub: session.idpSub, actorEmail: session.idpEmail,
+      action: 'certificate.import_pfx', targetType: 'mailbox', targetId: mailbox.ref, ip: ctx.ip,
+      detail: { version: stored.version, chainLength: verdict.chainCount },
+    });
+    logger.info({
+      mailbox: mailbox.address, version: stored.version,
+      msg: 'S/MIME sertifikası .pfx dosyasından içeri alındı',
+    });
+
+    ctx.json(200, {
+      ok: true,
+      version: stored.version,
+      replaced: stored.replaced,
+      chainLength: verdict.chainCount,
+      macVerified: parsed.macVerified,
+    });
   });
 
   /** IdP'nin bu kullanıcı adına verdiği tüm sertifikalar (uzaktan). */
@@ -893,6 +1049,134 @@ function parseAddressField(value) {
   return out;
 }
 
+/** Birden fazla sertifika taşıyan bir PEM bloğunu tek tek ayırır. */
+function splitPemChain(pem) {
+  return String(pem || '')
+    .split(/(?=-----BEGIN CERTIFICATE-----)/)
+    .map((s) => s.trim())
+    .filter((s) => s.includes('BEGIN CERTIFICATE'));
+}
+
+/**
+ * .pfx içeriğindeki hangi sertifikanın bu kutuya ait olduğunu bulur ve
+ * anahtarla eşleştiğini DOĞRULAR.
+ *
+ * İki ayrı soru soruluyor ve ikisi de gerekli:
+ *
+ *   1. Sertifika bu ADRESE mi ait? S/MIME'de adres SAN'daki rfc822Name'dir;
+ *      yalnızca CN'e bakmak, CN'ine istediğini yazan birine bu kutunun
+ *      adına imza attırırdı.
+ *   2. Özel anahtar bu SERTİFİKAYA mı ait? Açık anahtarlar karşılaştırılıyor.
+ *      Karşılaştırmadan saklamak, uyuşmayan bir çifti kabul edip hatayı ilk
+ *      imzalama denemesine ertelemek olurdu — ve o an, sorunun kaynağından
+ *      çok uzakta.
+ */
+function matchCertificateToMailbox(parsed, address) {
+  const addr = normalizeAddress(address);
+
+  const publicKeyOf = (pem) => {
+    try {
+      return crypto.createPublicKey(pem).export({ type: 'spki', format: 'der' }).toString('hex');
+    } catch { return null; }
+  };
+
+  const keyFingerprints = new Map();
+  for (const keyPem of parsed.privateKeys) {
+    const fp = publicKeyOf(keyPem);
+    if (fp) keyFingerprints.set(fp, keyPem);
+  }
+
+  const candidates = [];
+  for (const certPem of parsed.certificates) {
+    let x;
+    try { x = new crypto.X509Certificate(certPem); }
+    catch { continue; }
+    const san = String(x.subjectAltName || '').toLowerCase();
+    const subject = String(x.subject || '').toLowerCase();
+    const matchesAddress = san.includes(`email:${addr}`) || subject.includes(`emailaddress=${addr}`);
+    const fp = publicKeyOf(x.publicKey.export({ type: 'spki', format: 'pem' }));
+    candidates.push({ certPem, x, matchesAddress, hasKey: fp && keyFingerprints.has(fp), fp });
+  }
+
+  const chosen = candidates.find((c) => c.matchesAddress && c.hasKey);
+  if (!chosen) {
+    const addressMatch = candidates.find((c) => c.matchesAddress);
+    if (!addressMatch) {
+      return {
+        ok: false,
+        code: 'PFX_ADDRESS_MISMATCH',
+        reason: `Dosyadaki sertifikaların hiçbiri ${addr} adresini içermiyor `
+          + `(bulunan: ${candidates.map((c) => c.x.subject.replace(/\n/g, ' ')).join(' | ') || 'yok'})`,
+      };
+    }
+    return {
+      ok: false,
+      code: 'PFX_KEY_MISMATCH',
+      reason: `${addr} sertifikası bulundu ama dosyadaki özel anahtarlardan hiçbiri ona ait değil`,
+    };
+  }
+
+  if (new Date(chosen.x.validTo).getTime() < Date.now()) {
+    return { ok: false, code: 'PFX_EXPIRED', reason: 'Sertifikanın süresi dolmuş' };
+  }
+
+  // Kalan sertifikalar zincir sayılır: ara CA'lar burada geliyor ve
+  // olmadıklarında imza doğrulanamıyor.
+  const chain = candidates.filter((c) => c !== chosen).map((c) => c.certPem);
+  return {
+    ok: true,
+    certPem: chosen.certPem,
+    privateKeyPem: keyFingerprints.get(chosen.fp),
+    chainPem: chain.join('\n'),
+    chainCount: chain.length,
+  };
+}
+
+/**
+ * JSON gövdesinde bildirilen bir ekin baytlarını çözer.
+ *
+ * Kodlama TAHMİN EDİLMEZ, sırayla ELENİR — ve her adım tersine çevrilebilir
+ * olduğu için yanlış seçim sessiz bozulma değil, açık bir davranış üretir:
+ *
+ *   1. `content` zaten ikili ise (Buffer / dizi / {type:'Buffer'}) olduğu gibi.
+ *   2. `encoding` açıkça verilmişse ona uyulur ("base64" | "utf8" | "hex").
+ *   3. `data:...;base64,` ön eki varsa atılır ve gerisi base64'tür.
+ *   4. Aksi hâlde base64 olarak çözülür ve YENİDEN KODLANIP karşılaştırılır;
+ *      tutmuyorsa değer base64 değildir ve düz metin (UTF-8) kabul edilir.
+ *
+ * 4. adımdaki gidiş-dönüş denetimi şart: `Buffer.from(x,'base64')`
+ * hoşgörülüdür ve base64 olmayan girdiyi hata vermeden yutar. Denetim
+ * olmadan "aybars" gibi bir metin, sessizce üç çöp bayta dönüşürdü.
+ */
+function decodeDeclaredContent(entry) {
+  const raw = entry.content;
+  if (Buffer.isBuffer(raw)) return raw;
+  if (raw instanceof Uint8Array) return Buffer.from(raw);
+  if (Array.isArray(raw)) return Buffer.from(raw);
+  if (raw && typeof raw === 'object' && Array.isArray(raw.data)) return Buffer.from(raw.data);
+
+  let text = String(raw);
+  const declaredEncoding = String(entry.encoding || '').toLowerCase();
+  const dataUrl = text.match(/^data:[^,]*;base64,/i);
+  if (dataUrl) text = text.slice(dataUrl[0].length);
+
+  if (declaredEncoding === 'utf8' || declaredEncoding === 'text') return Buffer.from(text, 'utf8');
+  if (declaredEncoding === 'hex') return Buffer.from(text.replace(/\s+/g, ''), 'hex');
+
+  const compact = text.replace(/\s+/g, '');
+  const decoded = Buffer.from(compact, 'base64');
+  if (decoded.length && decoded.toString('base64').replace(/=+$/, '') === compact.replace(/=+$/, '')) {
+    return decoded;
+  }
+  if (dataUrl || declaredEncoding === 'base64') {
+    const err = new HttpError(400, `"${entry.fileName || 'ek'}" base64 olarak çözülemedi`, {
+      code: 'ATTACHMENT_ENCODING_INVALID',
+    });
+    throw err;
+  }
+  return Buffer.from(text, 'utf8');
+}
+
 /** Hem multipart dosyalarını hem JSON base64 eklerini tek biçime getirir. */
 function collectAttachments(fields, files, config) {
   const out = [];
@@ -910,23 +1194,10 @@ function collectAttachments(fields, files, config) {
     : [];
   for (const entry of [].concat(declared || [])) {
     if (!entry || !entry.content) continue;
-
-    let rawContent = entry.content;
-
-    // 1. İHTİMAL: Web arayüzü "data:image/png;base64,..." gibi bir Data URL gönderiyorsa öneki çöpe at.
-    if (rawContent.includes('base64,')) {
-      rawContent = rawContent.split('base64,')[1];
-    } 
-    // 2. İHTİMAL: Web arayüzü dosyayı base64'e çevirmeden doğrudan "aybars" gibi düz metin atıyorsa, 
-    // bunu algılayıp utf8 üzerinden manuel olarak base64'e çevir.
-    else if (!/^[A-Za-z0-9+/=\s]+$/.test(rawContent)) {
-      rawContent = Buffer.from(rawContent, 'utf8').toString('base64');
-    }
-
     out.push({
       fileName: safeFileName(entry.fileName || 'ek.bin'),
       contentType: entry.contentType || 'application/octet-stream',
-      content: Buffer.from(rawContent, 'base64'),
+      content: decodeDeclaredContent(entry),
       contentId: entry.contentId || '',
       inline: !!entry.inline && !!entry.contentId,
     });
@@ -990,4 +1261,7 @@ function sanitizeHtml(html) {
   return out;
 }
 
-module.exports = { registerWebmailRoutes, sanitizeHtml, parseAddressField, parseRange, collectAttachments };
+module.exports = {
+  registerWebmailRoutes, sanitizeHtml, parseAddressField, parseRange,
+  collectAttachments, decodeDeclaredContent, splitPemChain, matchCertificateToMailbox,
+};

@@ -30,12 +30,16 @@ function registerSiteRoutes(router, deps) {
     ctx.html(200, await deps.renderSite());
   });
 
-  router.get('/notifications', async (ctx) => {
+  // Yol İngilizce; Türkçe adı takma ad olarak duruyor. Eski bağlantılar
+  // (ve bu yolu kullanan testler) 404 almasın diye ikisi de kayıtlı.
+  const notificationsPanel = async (ctx) => {
     const session = await requireSession(ctx);
     const visits = await stores.visits.recent({ limit: 200 });
     const stats = await stores.visits.stats();
     ctx.html(200, await deps.renderNotifications({ visits, stats, session }));
-  });
+  };
+  router.get('/notifications', notificationsPanel);
+  router.get('/bildirimler', notificationsPanel);
 
   router.get('/api/v1/site/visits', async (ctx) => {
     await requireSession(ctx);

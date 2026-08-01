@@ -7,34 +7,38 @@ const { HttpError } = require('../router');
  *
  * Microsoft OAuth'un yerini alan kısım. Akış tarayıcıda şöyle görünüyor:
  *
- *   /giris          -> IdP'ye yönlendirme (PKCE ile)
- *   /oauth/callback -> kod jetona çevrilir, oturum çerezi konur
- *   /cikis          -> yerel oturum ve (istenirse) IdP oturumu kapatılır
+ *   /login           -> IdP'ye yönlendirme (PKCE ile)
+ *   /oauth/callback  -> kod jetona çevrilir, oturum çerezi konur
+ *   /authorize-scope -> eksik bir kapsam için onay turu (ör. cert:issue)
+ *   /logout          -> yerel oturum ve (istenirse) IdP oturumu kapatılır
+ *
+ * ── YOLLAR VE PARAMETRELER İNGİLİZCE ─────────────────────────────────────
+ * Bunlar arayüz metni değil, bir SÖZLEŞME: belgelerde, kayıtlarda, IdP
+ * yapılandırmasında (redirect_uri) ve üçüncü taraf istemcilerde geçiyorlar.
+ * `/yetki-yukselt?kapsam=…&donus=…` gibi bir adres, onu okuyan herkesin
+ * Türkçe bilmesini gerektiriyordu.
+ *
+ * Türkçe adlar KALDIRILMADI, takma ad olarak duruyor: kayıtlı yer imleri,
+ * eski istemciler ve halihazırda gönderilmiş bağlantılar kırılmasın.
  */
 function registerAuthRoutes(router, deps) {
   const { config, logger, sessions, stores } = deps;
 
-  /**
-   * Giriş.
-   *
-   * İki yol da kayıtlı: `/giris` arayüzün kullandığı ad, `/login` ise
-   * belgelerde ve hata sayfalarında geçen ad. Önceki sürümde YALNIZCA
-   * `/login` kayıtlıydı; arayüzdeki "Fitfak Kimlik ile giriş yap" düğmesi
-   * `/giris`e gidiyordu ve o yol, tek sayfa uygulamasının "bulunamadı"
-   * yakalayıcısına düşüp aynı sayfayı geri veriyordu. Yani düğme hiçbir şey
-   * yapmıyor gibi görünüyordu — istek başarılı, sayfa aynı.
-   */
+  /** İngilizce ad öncelikli, Türkçe ad takma ad. */
+  const param = (ctx, english, turkish) => ctx.query.get(english) || ctx.query.get(turkish) || null;
+
   const beginLogin = async (ctx) => {
+    const returnTo = param(ctx, 'return_to', 'donus') || ctx.query.get('return') || '/';
     const sid = ctx.cookies()[config.http.sessionCookieName];
     if (sid) {
       const existing = await sessions.authenticate({ sid, ip: ctx.ip });
-      if (existing) { ctx.redirect(safePath(ctx.query.get('donus')) || '/'); return; }
+      if (existing) { ctx.redirect(safePath(returnTo) || '/'); return; }
     }
     const begin = await sessions.beginLogin({
       ip: ctx.ip,
       userAgent: ctx.header('user-agent') || '',
-      returnTo: ctx.query.get('donus') || ctx.query.get('return_to') || '/',
-      loginHint: ctx.query.get('eposta') || ctx.query.get('login_hint') || null,
+      returnTo,
+      loginHint: param(ctx, 'login_hint', 'eposta'),
     });
     ctx.redirect(begin.url);
   };
@@ -94,15 +98,24 @@ function registerAuthRoutes(router, deps) {
       }
       ctx.redirect(safePath(result.returnTo) || '/');
     } catch (err) {
+      // Kapsam yükseltmesi BAŞKA bir hesapla onaylanmışsa bu bir giriş
+      // hatası değil, bir uyarı: kullanıcı hangi hesapla devam etmesi
+      // gerektiğini bilmeli, yoksa aynı yanlışı tekrarlar.
+      if (err.code === 'SCOPE_UPGRADE_SUBJECT_MISMATCH') {
+        logger.warn({ error: err.message, msg: 'kapsam yükseltmesi yanlış hesapla onaylandı' });
+        ctx.html(err.status || 403, errorPage('Yanlış hesapla onaylandı', err.message));
+        return;
+      }
       logger.warn({ error: err.message, msg: 'giriş tamamlanamadı' });
-      ctx.html(400, errorPage('Giriş tamamlanamadı', err.message));
+      ctx.html(err.status && err.status < 500 ? err.status : 400, errorPage('Giriş tamamlanamadı', err.message));
     }
   });
 
   const doLogout = async (ctx) => {
     const sid = ctx.cookies()[config.http.sessionCookieName];
     if (sid) {
-      await sessions.logout({ sid, revokeIdpSessions: ctx.query.get('hepsi') === '1' }).catch(() => {});
+      const everywhere = (param(ctx, 'all', 'hepsi') || '') === '1';
+      await sessions.logout({ sid, revokeIdpSessions: everywhere }).catch(() => {});
     }
     ctx.clearCookie(config.http.sessionCookieName);
     ctx.redirect('/');
@@ -118,25 +131,31 @@ function registerAuthRoutes(router, deps) {
    * Kullanıcıyı giriş ekranına atmak yerine yalnızca EKSİK olan için onay
    * istiyoruz; dönüşte aynı oturum devam eder.
    */
-  router.get('/yetki-yukselt', async (ctx) => {
+  const beginScopeUpgrade = async (ctx) => {
+    const returnTo = param(ctx, 'return_to', 'donus') || ctx.query.get('return') || '/';
     const sid = ctx.cookies()[config.http.sessionCookieName];
     const session = sid ? await sessions.authenticate({ sid, ip: ctx.ip }) : null;
-    if (!session) { ctx.redirect(`/giris?donus=${encodeURIComponent(ctx.query.get('donus') || '/')}`); return; }
+    if (!session) { ctx.redirect(`/login?return_to=${encodeURIComponent(returnTo)}`); return; }
 
-    const scope = String(ctx.query.get('kapsam') || config.trust.issueScope);
+    const scope = String(param(ctx, 'scope', 'kapsam') || config.trust.issueScope);
     const allowed = new Set([...config.idp.scopes, config.trust.issueScope]);
     if (!allowed.has(scope)) throw new HttpError(400, 'Bilinmeyen kapsam');
 
     const begin = await sessions.beginScopeUpgrade({
       session,
       scope,
-      returnTo: ctx.query.get('donus') || '/',
+      returnTo,
       ip: ctx.ip,
       userAgent: ctx.header('user-agent') || '',
     });
-    logger.info({ email: session.idpEmail, scope, msg: 'kapsam yükseltme başlatıldı' });
+    logger.info({
+      email: session.idpEmail, scope, requestedScopes: begin.scopes,
+      msg: 'kapsam yükseltme başlatıldı — onay AYNI hesapla verilmeli',
+    });
     ctx.redirect(begin.url);
-  });
+  };
+  router.get('/authorize-scope', beginScopeUpgrade);
+  router.get('/yetki-yukselt', beginScopeUpgrade);
 
   router.post('/logout', async (ctx) => {
     const sid = ctx.cookies()[config.http.sessionCookieName];
@@ -196,7 +215,7 @@ function errorPage(title, detail) {
   return page(title, `
     <h1>${escapeHtml(title)}</h1>
     <p>${escapeHtml(detail)}</p>
-    <p><a class="btn" href="/giris">Tekrar dene</a></p>
+    <p><a class="btn" href="/login">Tekrar dene</a></p>
   `);
 }
 
@@ -208,7 +227,7 @@ function noMailboxPage(reason, config) {
     ${info.action ? `<p>${escapeHtml(info.action)}</p>` : ''}
     <p>Yönetici ile iletişim:
       <a href="mailto:network@${escapeHtml(config.primaryDomain)}">network@${escapeHtml(config.primaryDomain)}</a></p>
-    <p><a class="btn" href="/cikis">Çıkış yap</a></p>
+    <p><a class="btn" href="/logout">Çıkış yap</a></p>
   `);
 }
 

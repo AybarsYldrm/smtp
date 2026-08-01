@@ -253,6 +253,113 @@ function registerAdminRoutes(router, deps) {
     ctx.json(200, { ok: done });
   });
 
+  /**
+   * SMTP TLS malzemesini bir .pfx dosyasından yükler.
+   *
+   * ── NEDEN BU UÇ VAR ──────────────────────────────────────────────────
+   * 465 (örtük TLS) yalnızca TLS malzemesi VARSA açılıyor, 587 ise TLS
+   * olmadan AUTH duyurmuyor (`requireTlsForAuth`). Yani sertifika yoksa
+   * gönderim portlarının ikisi de fiilen kullanılamaz durumda ve bunun
+   * tek belirtisi açılıştaki bir uyarı satırı.
+   *
+   * Malzemeyi diske kopyalamak da bir yoldu; kasa tercih edildi çünkü
+   * çok örnekli kurulumda dosya kopyalamak, örneklerden birinin eski
+   * sertifikayla kalmasıyla bitiyor.
+   *
+   * Yüklenen malzeme SONRAKİ AÇILIŞTA devreye girer: çalışan bir
+   * dinleyicinin altındaki TLS bağlamını değiştirmek, o an el sıkışan
+   * bağlantıları bozar.
+   */
+  router.post('/api/v1/admin/tls/import', async (ctx) => {
+    const session = await requireAdmin(ctx);
+    ctx.state.input = await ctx.input();
+    requireCsrf(ctx, session);
+
+    const { fields, files } = ctx.state.input;
+    const uploaded = (files || [])[0];
+    let certPem = String(fields.certPem || '');
+    let keyPem = String(fields.keyPem || '');
+    let chainPem = String(fields.chainPem || '');
+
+    if (uploaded || fields.pfx) {
+      const { PKCS12 } = require('../../certs/pkcs12');
+      const bytes = uploaded
+        ? uploaded.content
+        : Buffer.from(String(fields.pfx).replace(/\s+/g, ''), 'base64');
+      let parsed;
+      try {
+        parsed = new PKCS12(String(fields.password || '')).parse(bytes);
+      } catch (err) {
+        throw new HttpError(400, err.message, { code: 'PFX_UNREADABLE' });
+      }
+      if (!parsed.certificates.length || !parsed.privateKeys.length) {
+        throw new HttpError(400, 'Dosyada sertifika ve özel anahtar birlikte bulunmalı', {
+          code: 'PFX_INCOMPLETE',
+        });
+      }
+      [certPem] = parsed.certificates;
+      [keyPem] = parsed.privateKeys;
+      chainPem = parsed.certificates.slice(1).join('\n');
+    }
+
+    if (!certPem.includes('BEGIN CERTIFICATE') || !keyPem.includes('PRIVATE KEY')) {
+      throw new HttpError(400, 'PEM sertifika ve özel anahtar ya da bir .pfx dosyası gerekiyor', {
+        code: 'TLS_MATERIAL_MISSING',
+      });
+    }
+
+    // Anahtarın sertifikaya ait olduğu doğrulanır. Uyuşmayan bir çifti
+    // kaydetmek, TLS el sıkışmasının çalışma anında ve anlaşılmaz bir
+    // hatayla düşmesi demek.
+    const crypto = require('node:crypto');
+    let x509;
+    try { x509 = new crypto.X509Certificate(certPem); }
+    catch (err) { throw new HttpError(400, `Sertifika okunamadı: ${err.message}`, { code: 'TLS_CERT_INVALID' }); }
+    if (!x509.checkPrivateKey(crypto.createPrivateKey(keyPem))) {
+      throw new HttpError(400, 'Özel anahtar bu sertifikaya ait değil', { code: 'TLS_KEY_MISMATCH' });
+    }
+    if (new Date(x509.validTo).getTime() < Date.now()) {
+      throw new HttpError(400, 'Sertifikanın süresi dolmuş', { code: 'TLS_CERT_EXPIRED' });
+    }
+    // Sunucu adı sertifikada yoksa istemciler bağlantıyı reddeder; bunu
+    // yüklerken söylemek, ilk gönderim denemesinde öğrenmekten iyi.
+    const covers = x509.checkHost(config.hostname) != null;
+
+    const stored = await stores.certificates.store({
+      usage: 'tls',
+      subjectAddress: config.hostname,
+      certPem,
+      chainPem,
+      privateKeyPem: keyPem,
+      issuedVia: 'admin-import',
+      requestedBySub: session.idpSub,
+      renewAtRatio: config.trust.renewAtLifetimeRatio,
+    });
+
+    await stores.audit.record({
+      actorSub: session.idpSub, actorEmail: session.idpEmail, action: 'tls.import',
+      targetType: 'system', targetId: config.hostname, ip: ctx.ip,
+      detail: { version: stored.version, notAfter: new Date(x509.validTo).getTime(), covers },
+    });
+    logger.warn({
+      hostname: config.hostname, version: stored.version, covers,
+      notAfter: x509.validTo,
+      msg: 'SMTP TLS malzemesi yüklendi — 465 ve 587 için yeniden başlatma gerekiyor',
+    });
+
+    ctx.json(200, {
+      ok: true,
+      version: stored.version,
+      subject: String(x509.subject || '').replace(/\n/g, ', '),
+      notAfter: new Date(x509.validTo).getTime(),
+      coversHostname: covers,
+      chainLength: chainPem ? chainPem.split('BEGIN CERTIFICATE').length - 1 : 0,
+      note: covers
+        ? 'Sunucu yeniden başlatıldığında 465 açılacak ve 587 AUTH duyuracak.'
+        : `DİKKAT: sertifika ${config.hostname} adını KAPSAMIYOR; istemciler bağlantıyı reddedebilir.`,
+    });
+  });
+
   /* ── API jetonları ─────────────────────────────────────────── */
 
   router.post('/api/v1/admin/api-tokens', async (ctx) => {

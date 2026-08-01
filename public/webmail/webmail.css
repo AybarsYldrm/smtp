@@ -555,6 +555,18 @@ textarea.body { min-height: 200px; }
 
 .empty { padding: 30px 16px; text-align: center; color: var(--ink-3); font-size: 13px; }
 
+/* ─────────────── .pfx alışverişi ─────────────── */
+/* Katlanmış duruyor: özel anahtarı dışa aktarmak sık yapılan bir iş değil
+   ve her açılışta göz önünde durması, kazara tıklamayı davet ederdi. */
+.pfx-panel {
+  margin-top: 16px; border: 1px solid var(--line); border-radius: 6px;
+  padding: 10px 13px; font-size: 12.5px;
+}
+.pfx-panel > summary { cursor: pointer; color: var(--ink-2); user-select: none; }
+.pfx-panel > summary:hover { color: var(--ink); }
+.pfx-panel[open] > summary { margin-bottom: 10px; }
+.pfx-panel .btn-row { margin: 10px 0; }
+
 /* ─────────────── ayarlar ─────────────── */
 
 .settings section { padding-bottom: 20px; margin-bottom: 20px; border-bottom: 1px solid var(--line); }

@@ -240,10 +240,25 @@ class SessionRepo {
       });
       patch.refreshTokenSecretRef = name;
     }
-    
-    // BURASI DÜZELTİLDİ: IdP'den gelen yeni scope bilgisi açıkça oturum kaydına işleniyor
-    if (scope != null) {
-      patch.scope = String(scope);
+
+    // Kapsam yazılır ama BOŞ DİZGEYLE ÜZERİNE YAZILMAZ.
+    //
+    // fitfak-idp'nin `/oauth/token` yanıtı `scope` alanı taşımıyor (RFC 6749
+    // §5.1 onu yalnızca istenenden farklıysa zorunlu kılıyor). Eski kod
+    // `scope != null` diye baktığı için, yanıttan gelen '' değeri geçerli
+    // sayılıp kaydı SİLİYORDU: kullanıcı `cert:issue` onayını verip
+    // dönüyordu, jeton kapsamı taşıyordu, ama yerel kayıt boşalıyor ve
+    // sertifika isteği yine 409 ile reddediliyordu.
+    //
+    // Bilinen bir kapsamı bilinmeyenle değiştirmek bilgi kaybıdır; bilgi
+    // kaybının yönü de bu vakada tam olarak yanlıştı.
+    if (scope != null && String(scope).trim()) {
+      patch.scope = String(scope).trim();
+    } else if (scope != null && String(session.scope || '').trim() && this.logger) {
+      this.logger.debug({
+        msg: 'IdP boş kapsam bildirdi; oturumdaki kapsam korunuyor',
+        kept: session.scope,
+      });
     }
 
     if (Object.keys(patch).length) {
@@ -252,7 +267,8 @@ class SessionRepo {
     }
     return patch;
   }
-  
+
+
   async sweepExpired({ limit = 500 } = {}) {
     const rows = await this.sessions.findRange('expiresAt', 1, Date.now(), { limit });
     let n = 0;

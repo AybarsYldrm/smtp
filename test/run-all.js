@@ -19,6 +19,7 @@ const SUITES = [
   ['client', 'SMTP istemcisi ve kütüphane yüzeyi'],
   ['auth-identity', 'IdP kimlik doğrulama ve kimlik bağları'],
   ['http-api', 'HTTP API, gerçek zamanlı, kişisel site'],
+  ['driver-shapes', 'sürücü şekilleri, kasa zarfı, PKCS#12'],
 ];
 
 const only = process.argv.slice(2).filter((a) => !a.startsWith('-'));

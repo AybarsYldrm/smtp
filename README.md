@@ -153,7 +153,63 @@ zinciri kısmen kurup test ediyor.
 
 ## Düzeltilen hatalar
 
-Bu sürümde kapatılan, önceki `server.js` prototipinden gelen sorunlar:
+### Üretimde bildirilen dört hata
+
+Dördü de aynı yerden değil ama üçü aynı kökten geliyordu: bir `bytes`
+alanına yazılan değerin **geri okunduğunda hangi türle geleceğinin sürücüye
+bağlı olması**. Dosya sürücüsü (testler) JSON üzerinden gittiği için bu şekil
+değişimini yaşamıyor; hata yalnızca gRPC sürücüsüyle, yani yalnızca üretimde
+görünüyordu. `test/driver-shapes.test.js` artık o sürücüyü taklit ediyor.
+
+**A. Gelen eklerin base64 ve eksik inmesi**
+
+Blob parçaları `bytes` alanına base64 **dizge** olarak yazılıyordu. Dizgeyi
+bayta çeviren bir sürücüde okuma tarafındaki `Buffer.from(değer, 'base64')`
+kodlama argümanını **yok sayıp** baytları kopyalıyor — çünkü girdi zaten
+Buffer. İçerik base64 metni olarak kalıyor, `content-length` ise ham boyuta
+göre yazıldığı için (base64 ~%37 daha uzun) tarayıcı gövdeyi **kesiyordu**.
+Parçalar artık `b64:` ön ekiyle kendini tanıtıyor; ön eksiz eski kayıtlar
+blob üstbilgisindeki uzunluk/özetle belirlenimci olarak çözülüyor.
+
+**B. `Unsupported state or unable to authenticate data` — giden posta hiç gitmiyordu**
+
+Aynı belirsizlik kasada: DKIM anahtarı yazılıyor ama geri okunamıyor ve
+`pipeline.send` 500 ile düşüyordu. AES-GCM'in bu hatası üç ayrı nedene
+çıkıyor (kasa sırrı değişti / veri bozuldu / veri sağlam ama farklı şekilde
+geri geldi) ve üçünün çözümü farklı. Zarf artık `FMV1` imzası taşıyor, üç
+şekil de ayırt ediliyor ve nedenler **ayrı hata kodları** veriyor. Yazma
+sonrası gidiş-dönüş denetimi, sürücü uyumsuzluğunu aylar sonra gönderim
+yolunda değil yazma anında gösteriyor. Açılamayan bir DKIM anahtarı artık
+bütün gönderimi durdurmuyor.
+
+**C. Her Gmail iletisinin `dmarc=fail` olması**
+
+`spf.check()` mekanizmanın **eşleştiği** alanı döndürüyordu. gmail.com'un
+kaydı `redirect=_spf.google.com` olduğu için sonuç `_spf.google.com` diye
+dönüyor ve başlıkta `smtp.mailfrom=_spf.google.com` yazıyordu. DMARC
+hizalaması ise From alan adını **doğrulanan kimliğin** alanıyla karşılaştırır
+— o kimlik MAIL FROM'dur, yani `gmail.com`. Hizalama hiçbir zaman tutmuyor,
+SPF geçmiş olmasına rağmen DMARC düşüyordu. Bu yalnızca Gmail'i değil,
+`redirect`/`include` kullanan **her** büyük sağlayıcıyı etkiliyordu.
+
+**D. Sertifika isteğinin sonsuza dek 409 dönmesi**
+
+fitfak-idp'nin `/oauth/token` yanıtı `scope` alanı taşımıyordu (RFC 6749 §5.1
+onu yalnızca istenenden farklıysa zorunlu kılıyor). Kapsam denetimi ise
+yalnızca yerel oturum kaydına bakıyordu. Sonuç kısır döngüydü: kullanıcı
+`cert:issue` onayını veriyor, IdP kapsamı **jetonun içine** yazıyor, ama
+yanıtta göndermediği için yerel kayda boş dizge yazılıyor ve istek yine 409
+dönüyordu. Kapsam artık jetonun kendi savından okunuyor, boş değer mevcut
+kapsamı ezmiyor ve IdP yanıtına `scope` eklendi.
+
+Aynı akışta bir yetki açığı da vardı: onay turu dönüşünde jetonun **öznesi
+hiç denetlenmiyordu**. IdP'de birden fazla hesap açıkken onay ekranında başka
+bir hesap seçilirse, o kişinin jetonu yerel oturuma yazılıyor ve sertifika
+ona yazılıyordu. Artık jetonun öznesi, yükseltmeyi başlatan oturumun
+öznesiyle karşılaştırılıyor; uyuşmazsa yükseltme reddediliyor ve yanlış
+hesabın jetonu iptal ediliyor.
+
+### Önceki `server.js` prototipinden gelen sorunlar
 
 **1. 465/587 üzerinden gönderilen postada DKIM imzası yoktu** *(bildirilen hata)*
 
@@ -822,9 +878,16 @@ Hata kodları: `403 SENDER_NOT_ALLOWED`, `409 NO_SMIME_CERT`,
 | `GET /healthz` | Kimlik doğrulamasız, sır içermez (yük dengeleyici / izleme) |
 | `GET /api/v1/status` | Kuyruk, sertifika, DNS, alan adları, kutular — korumalı |
 | `GET /api/v1/status/queue?status=…` | Kuyruk ayrıntısı |
-| `GET /api/v1/status/dns?refresh=1` | DNS denetim sonucu |
+| `GET /api/v1/status/dns?refresh=1` | DNS denetim sonucu + sağlayıcı durumu |
 | `POST /api/v1/status/dns/apply` | Eksik kayıtları yaz (yönetici) |
+| `POST /api/v1/status/dns/verify` | Cloudflare jetonu ve bölgesi çalışıyor mu (yönetici) |
+| `GET /api/v1/status/vault` | Kasadaki her sır AÇILABİLİYOR MU (yönetici, değer dönmez) |
 | `GET /api/v1/status/audit?action=&actor=&limit=` | Denetim kaydı |
+
+`/status/vault`, "kasaya yazma çalışıyor ama okuma çalışıyor mu" sorusunun
+ölçülebilir cevabı. `failed` ile `mismatched` **ayrı** sayılır: ilki gerçek
+bozulma (yedekten dönmek gerekir), ikincisi kaydın başka bir kasa anahtarıyla
+sarılmış olması (rotasyonu tamamlamak gerekir).
 
 ### Sertifika
 
@@ -833,13 +896,21 @@ Hata kodları: `403 SENDER_NOT_ALLOWED`, `409 NO_SMIME_CERT`,
 | `GET /api/v1/mailboxes/:mailbox/certificate` | Kayıtlı sertifika (özel anahtar DÖNMEZ) |
 | `POST /api/v1/mailboxes/:mailbox/certificate/issue` | Kullanıcının kendi kimliğiyle iste/yenile |
 | `POST /api/v1/mailboxes/:mailbox/certificate/register` | Kendi cihazında ürettiği sertifikayı kaydet |
+| `POST /api/v1/mailboxes/:mailbox/certificate/export` | Sertifika + özel anahtar → `.pfx` (owner, CSRF, parola zorunlu) |
+| `POST /api/v1/mailboxes/:mailbox/certificate/import` | `.pfx` dosyasından içe al (owner, CSRF) |
 | `GET /api/v1/mailboxes/:mailbox/certificate/remote` | IdP'nin bu kullanıcı adına verdiği sertifikalar |
+
+`export` özel anahtarın sunucudan çıktığı **tek yol**: en az 8 karakterlik bir
+dosya parolası ister, denetim kaydına yazılır ve dosya Thunderbird, Outlook,
+Apple Mail ile telefon profillerine doğrudan aktarılabilir. `import` ise
+sertifikanın SAN'ında kutu adresinin bulunduğunu ve özel anahtarın gerçekten o
+sertifikaya ait olduğunu doğrular; ikisinden biri tutmazsa kayıt yapılmaz.
 
 `issue` hata kodları:
 
 | Kod | Anlamı ve çıkışı |
 | --- | --- |
-| `409 CERT_SCOPE_REQUIRED` | Oturum `cert:issue` taşımıyor. Yanıtın `detail.authorizeUrl` alanı onay adresini veriyor. |
+| `409 CERT_SCOPE_REQUIRED` | Oturum `cert:issue` taşımıyor. Yanıtın `detail.authorizeUrl` alanı onay adresini, `detail.approveAs` ise onayın hangi hesapla verilmesi gerektiğini veriyor. |
 | `409 IDP_REAUTH_REQUIRED` | IdP jetonu yenilenemedi; yeniden giriş gerekiyor. |
 | `502 PROFILE_NOT_ALLOWED` | IdP bu hesaba bu profilde izin vermiyor (yönetim paneli → Sertifika yetkileri). |
 | `502 USER_NOT_FOUND` | Yanlış kimlikle sorulmuş — bkz. [S/MIME sertifikaları](#smime-sertifikaları). |
@@ -854,7 +925,13 @@ Hata kodları: `403 SENDER_NOT_ALLOWED`, `409 NO_SMIME_CERT`,
 | `GET,POST /api/v1/admin/identity-links` · `DELETE …/:email` | Kimlik bağları |
 | `POST,GET /api/v1/admin/grants` · `DELETE …/:mailbox/:sub` | Kutu erişimleri |
 | `GET /api/v1/admin/certificates` · `POST …/sweep` · `POST …/revoke` | Sertifikalar |
+| `POST /api/v1/admin/tls/import` | SMTP TLS malzemesi (`.pfx` ya da PEM) — 465/587 için |
 | `POST,GET /api/v1/admin/api-tokens` · `DELETE …/:ref` | API jetonları |
+
+`tls/import` olmadan 465 hiç açılmaz ve 587 AUTH duyurmaz; ikisi de sessizce
+kullanılamaz duruma düşer. Yükleme sırasında anahtarın sertifikaya ait olduğu
+ve sertifikanın `hostname`'i kapsadığı doğrulanır. Malzeme **sonraki
+açılışta** devreye girer.
 
 ### Kişisel site (`aybars.net.tr`)
 
@@ -985,6 +1062,40 @@ Denetim **salt okunur** çalışır. Yazması için `FITFAK_DNS_AUTO_APPLY=1` ve
 `CF_API_TOKEN` + `CF_ZONE_ID` gerekir. Açmadan önce şunu bilin: otomatik
 uygulama, elle konmuş bilinçli bir kaydı (ikinci MX, geçiş dönemi SPF'i) geri
 alır. Öneri: kapalı bırakıp `POST /api/v1/status/dns/apply` ile elle tetikleyin.
+
+### "Cloudflare'e gerçekten eklendi mi?"
+
+Yazma **geri okumayla doğrulanır**: kayıt yazıldıktan sonra Cloudflare'den
+tekrar istenir ve saklanan değer beklenenle karşılaştırılır. Kayıt satırı
+işlemi, Cloudflare kayıt kimliğini ve doğrulama sonucunu taşır:
+
+```
+WARN [dns] DNS kaydı yazıldı ve Cloudflare tarafından doğrulandı
+  type=TXT name=mail._domainkey.fitfak.net purpose=dkim
+  action=created cloudflareId=3f1c… confirmed=true storedContent="v=DKIM1; k=rsa; p=MIIBIj…"
+```
+
+`confirmed=false` görürseniz kayıt yazılmış ama Cloudflare onu farklı
+saklamıştır (tırnaklama, TXT parçalama) — kaydı panelde gözden geçirin.
+
+Yazma yapılamıyorsa **nedeni açılışta** söylenir:
+
+```
+WARN [dns] DNS denetimi planlandı  autoApply=true writable=false
+  writeBlockedBy="CF_ZONE_ID verilmemiş"
+```
+
+Kimlik bilgilerini ve bölgeyi denemek için:
+
+```http
+POST /api/v1/status/dns/verify      → { ok, zone, zoneId, status }
+```
+
+Denetim üç çözücüyü **ayrı ayrı** raporlar (sistem, Cloudflare DoH, Google
+DoH). Bir kaydın Cloudflare'de görünüp Google'da görünmemesi "yayılma sürüyor"
+demektir ve "kayıt yok"tan farklıdır. Yayımlanması gereken kayıtlar denetim
+sonunda tek blok hâlinde yazılır — otomatik yazma kapalıyken listeyi
+oradan alabilirsiniz.
 
 `p=quarantine` ile başlayıp raporlar temizlendikten sonra `p=reject`'e geçmek
 doğru sıra; ters sırası, gözden kaçan bir gönderim yolunun postasını sessizce

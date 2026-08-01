@@ -184,7 +184,10 @@ const SMTP = {
     submission: int('FITFAK_SMTP_PORT_SUBMISSION', 'smtp.ports.submission', 587),
     smtps: int('FITFAK_SMTP_PORT_SMTPS', 'smtp.ports.smtps', 465),
   },
-  maxMessageBytes: int('FITFAK_SMTP_MAX_MESSAGE_BYTES', 'smtp.maxMessageBytes', 40 * 1024 * 1024),
+  // Tel üzerindeki ileti sınırı. Ek sınırlarının ÜSTÜNDE olmak zorunda:
+  // base64 taşıma yükü ~%37 ve başlıklar da yer kaplıyor. Bkz. LIMITS
+  // başındaki not.
+  maxMessageBytes: int('FITFAK_SMTP_MAX_MESSAGE_BYTES', 'smtp.maxMessageBytes', 75 * 1024 * 1024),
   maxRecipients: int('FITFAK_SMTP_MAX_RCPT', 'smtp.maxRecipients', 100),
   maxAuthFailures: int('FITFAK_SMTP_MAX_AUTH_FAILURES', 'smtp.maxAuthFailures', 5),
   authWindowMs: int('FITFAK_SMTP_AUTH_WINDOW_MS', 'smtp.authWindowMs', 60_000),
@@ -208,12 +211,33 @@ const SMTP = {
 /* ─────────────────────────────────────────────────────────────
    POSTA KUTUSU SINIRLARI (ekler dâhil)
    ───────────────────────────────────────────────────────────── */
+/* ─────────────────────────────────────────────────────────────
+   SINIRLAR — ÜÇÜ BİRDEN TUTARLI OLMAK ZORUNDA
+
+   Bir ekin teslim edilebilmesi için üç ayrı sınırı birden geçmesi
+   gerekiyor ve biri diğerlerinden düşükse fazlası ölü ayar olur:
+
+     smtp.maxMessageBytes        tel üzerindeki TÜM ileti (base64 dâhil)
+     limits.maxTotalAttachmentBytes  ekler toplamı (ÇÖZÜLMÜŞ baytlar)
+     limits.maxAttachmentBytes   tek ek (ÇÖZÜLMÜŞ baytlar)
+
+   base64 taşıma yükü ~%37: 40 MB'lık bir ek telde ~55 MB yer kaplar.
+   Eski öntanımlılar bu payı hesaba katmıyordu — `maxMessageBytes` 40 MB
+   iken tek ek sınırı 25 MB'dı, yani 25 MB'lık bir ek telde 34 MB olup
+   sınıra yaklaşıyor, birkaç ek birlikte gelince ileti hiç kabul
+   edilmiyordu. Sonuç, gönderenin 552 alması ve bizim tarafta yalnızca
+   bir satır kayıt kalmasıydı.
+
+   Yeni değerler payı içeriyor. Not: Gmail 25 MB, Outlook 20 MB kabul
+   ediyor; bizim daha yükseğe çıkmamız GELEN posta için anlamlı,
+   giden posta karşı tarafın sınırına takılabilir.
+   ───────────────────────────────────────────────────────────── */
 const LIMITS = {
   mailboxQuotaBytes: int('FITFAK_MAILBOX_QUOTA_BYTES', 'limits.mailboxQuotaBytes', 5 * 1024 * 1024 * 1024),
   maxAttachmentsPerMessage: int('FITFAK_MAX_ATTACHMENTS', 'limits.maxAttachmentsPerMessage', 25),
-  maxAttachmentBytes: int('FITFAK_MAX_ATTACHMENT_BYTES', 'limits.maxAttachmentBytes', 25 * 1024 * 1024),
+  maxAttachmentBytes: int('FITFAK_MAX_ATTACHMENT_BYTES', 'limits.maxAttachmentBytes', 40 * 1024 * 1024),
   maxInlineImageBytes: int('FITFAK_MAX_INLINE_IMAGE_BYTES', 'limits.maxInlineImageBytes', 8 * 1024 * 1024),
-  maxTotalAttachmentBytes: int('FITFAK_MAX_TOTAL_ATTACHMENT_BYTES', 'limits.maxTotalAttachmentBytes', 35 * 1024 * 1024),
+  maxTotalAttachmentBytes: int('FITFAK_MAX_TOTAL_ATTACHMENT_BYTES', 'limits.maxTotalAttachmentBytes', 50 * 1024 * 1024),
   maxBodyBytes: int('FITFAK_MAX_BODY_BYTES', 'limits.maxBodyBytes', 2 * 1024 * 1024),
   // Gövde/ek baytları bu boyutta parçalara ayrılıp saklanır. Kayıt başına
   // sınır, uzak (gRPC) sürücüde tek çerçevenin taşınabilir olmasını sağlar.
@@ -394,7 +418,10 @@ const HTTP_CFG = {
   // Yalnızca aşağıdaki adreslerden gelen bağlantılarda bu başlıklara
   // güvenilir.
   trustedProxies: list('FITFAK_HTTP_TRUSTED_PROXIES', 'http.trustedProxies', ['127.0.0.1', '::1', '127.0.1.1', '127.0.1.2']),
-  maxBodyBytes: int('FITFAK_HTTP_MAX_BODY_BYTES', 'http.maxBodyBytes', 64 * 1024 * 1024),
+  // Webmail'den gönderim de aynı sınırlara tabi; gövde sınırı ek
+  // sınırlarının altında kalırsa büyük bir ek arayüzden hiç
+  // gönderilemez ve hata "413" olarak, sebebi söylenmeden görünür.
+  maxBodyBytes: int('FITFAK_HTTP_MAX_BODY_BYTES', 'http.maxBodyBytes', 96 * 1024 * 1024),
   attachmentTokenTtlMs: int('FITFAK_ATT_TOKEN_TTL_MS', 'http.attachmentTokenTtlMs', 4 * 60 * 60 * 1000),
   rateLimit: {
     windowMs: int('FITFAK_HTTP_RATE_WINDOW_MS', 'http.rateLimit.windowMs', 60_000),
@@ -405,6 +432,40 @@ const HTTP_CFG = {
   // al (geliştirmede kapatılır).
   cacheStatic: bool('FITFAK_HTTP_CACHE_STATIC', 'http.cacheStatic', IS_PROD),
   sessionCookieName: pick('FITFAK_SESSION_COOKIE', 'http.sessionCookieName', 'fitfak_mail_sid'),
+  /* ── İÇERİK GÜVENLİK POLİTİKASI (CSP) ─────────────────────────────────
+     ── BİLDİRİLEN HATA ────────────────────────────────────────────────
+       (index):238 Executing inline script violates … 'script-src 'self''
+       (index):1   Loading the script
+                   'https://static.cloudflareinsights.com/beacon.min.js/v45132…'
+                   violates … "script-src 'self'"
+
+     İkisi de BİZİM kodumuz değil. Cloudflare, Web Analytics (Browser
+     Insights) açıkken HTML yanıtına `</body>` etiketinden hemen önce bir
+     betik enjekte ediyor: bir satır içi parçacık ve bir de harici
+     `beacon.min.js`. `public/webmail/index.html` 237 satır; tarayıcının
+     "238. satırdaki satır içi betik" dediği şey tam olarak o enjeksiyon.
+
+     Üç seçenek var ve üçü de burada yapılandırılabilir:
+
+       1. Cloudflare panelinde Web Analytics'i kapatmak — en temizi, çünkü
+          o zaman politikayı gevşetmeye gerek kalmaz.
+       2. Beacon'a izin vermek (öntanımlı davranış): kaynak izni + satır
+          içi parçacığın SHA-256 özeti. Özet, `'unsafe-inline'` yerine
+          kullanılıyor; `'unsafe-inline'` bütün satır içi betikleri açardı
+          ve webmail'de bir XSS'in çalışması için gereken tek şey odur.
+       3. `FITFAK_HTTP_CSP_SCRIPT_EXTRA=''` ile listeyi boşaltmak.
+
+     Özet Cloudflare parçacığı değiştiğinde eskir; o yüzden ayar
+     değiştirilebilir ve eskimesi yalnızca konsolda bir uyarı üretir,
+     sayfayı bozmaz. */
+  cspScriptExtra: list('FITFAK_HTTP_CSP_SCRIPT_EXTRA', 'http.cspScriptExtra', [
+    'https://static.cloudflareinsights.com',
+    "'sha256-wCTYAN28EakRHUoy3+2xBsRILoOO9GxTSdjrVnbybfA='",
+  ]),
+  cspConnectExtra: list('FITFAK_HTTP_CSP_CONNECT_EXTRA', 'http.cspConnectExtra', [
+    'https://cloudflareinsights.com',
+    'https://static.cloudflareinsights.com',
+  ]),
   // Çerezler cloudflared TLS'i sonlandırdığı için Secure işaretlenir; yerel
   // düz HTTP geliştirmede kapatılabilir.
   secureCookies: bool('FITFAK_SECURE_COOKIES', 'http.secureCookies', true),
@@ -528,7 +589,41 @@ config.validate = function validate() {
   }
   if (!DOMAINS.length) throw new Error('[config] En az bir posta alan adı gerekir.');
   if (!QUEUE.backoffMs.length) throw new Error('[config] queue.backoffMs boş olamaz.');
+
+  // Sınırlar birbirinden habersiz ayarlanabiliyor ve tutarsızlıkları ancak
+  // gerçek bir ek gönderilmeye çalışıldığında, "552 çok büyük" ya da "413"
+  // olarak görülüyor. Tutarsızlık AÇILIŞTA söylenir; hata değil uyarıdır,
+  // çünkü bilinçli bir tercih de olabilir.
+  const warnings = [];
+  if (LIMITS.maxAttachmentBytes > LIMITS.maxTotalAttachmentBytes) {
+    warnings.push(
+      `limits.maxAttachmentBytes (${mb(LIMITS.maxAttachmentBytes)}) toplam sınırdan `
+      + `(${mb(LIMITS.maxTotalAttachmentBytes)}) büyük — tek ek asla o boyuta ulaşamaz.`,
+    );
+  }
+  // base64 yükü: 4 bayt çıktı / 3 bayt girdi.
+  const wireNeeded = Math.ceil(LIMITS.maxTotalAttachmentBytes * 4 / 3) + LIMITS.maxBodyBytes;
+  if (wireNeeded > SMTP.maxMessageBytes) {
+    warnings.push(
+      `smtp.maxMessageBytes (${mb(SMTP.maxMessageBytes)}) ek sınırları için yetersiz: `
+      + `${mb(LIMITS.maxTotalAttachmentBytes)} ek + gövde, telde ~${mb(wireNeeded)} yer kaplar. `
+      + 'Sınıra yakın iletiler 552 ile reddedilir.',
+    );
+  }
+  if (HTTP_CFG.maxBodyBytes < wireNeeded) {
+    warnings.push(
+      `http.maxBodyBytes (${mb(HTTP_CFG.maxBodyBytes)}) webmail'den ${mb(LIMITS.maxTotalAttachmentBytes)} `
+      + 'ek göndermeye yetmez; istek 413 ile reddedilir.',
+    );
+  }
+  if (warnings.length) {
+    const log = require('./util/log');
+    for (const warning of warnings) log.child('config').warn({ msg: warning });
+  }
+  config.limitWarnings = warnings;
   return config;
 };
+
+function mb(bytes) { return `${Math.round(bytes / (1024 * 1024))} MB`; }
 
 module.exports = config;

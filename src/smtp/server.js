@@ -211,7 +211,58 @@ class SmtpServer {
       this.logger.warn({ port: smtpsPort, msg: '465 açılmadı: TLS malzemesi yok' });
     }
 
+    this._reportReadiness();
     return this;
+  }
+
+  /**
+   * Gönderim portlarının GERÇEKTEN kullanılabilir olup olmadığını söyler.
+   *
+   * "587 dinliyor" satırı tek başına yanıltıcı: TLS malzemesi yoksa o port
+   * AUTH duyurmuyor (`requireTlsForAuth`) ve hiçbir posta istemcisi
+   * bağlanamıyor — 465 ise hiç açılmıyor. İkisi de sessizce oluyordu ve
+   * belirtisi yalnızca "eposta gönderemiyorum" oluyordu.
+   *
+   * Bu yüzden açılışta durum AÇIKÇA özetleniyor ve `snapshot()` üzerinden
+   * durum API'sine de taşınıyor.
+   */
+  _reportReadiness() {
+    const ports = this.config.smtp.ports;
+    const hasTls = !!this.tlsOptions;
+    const authUsable = hasTls || !this.config.smtp.requireTlsForAuth;
+
+    this.readiness = {
+      tls: hasTls,
+      mx: this.servers.some((s) => s.label === 'MX'),
+      submission: this.servers.some((s) => s.label === 'SUBMISSION'),
+      smtps: this.servers.some((s) => s.label === 'SMTPS'),
+      authUsable,
+      warnings: [],
+    };
+
+    if (!hasTls) {
+      this.readiness.warnings.push(
+        `TLS malzemesi yok: ${ports.smtps} (örtük TLS) AÇILMADI`
+        + (this.config.smtp.requireTlsForAuth
+          ? ` ve ${ports.submission} üzerinde AUTH duyurulmuyor — posta istemcileri gönderim yapamaz.`
+          : '.')
+        + ' Sertifika yüklemek için: POST /api/v1/admin/tls/import'
+        + ` (ya da ${this.config.certDir} altına privkey.pem + fullchain.pem).`,
+      );
+    }
+    if (!this.readiness.submission && ports.submission) {
+      this.readiness.warnings.push(`${ports.submission} (submission) dinlenemedi.`);
+    }
+
+    for (const warning of this.readiness.warnings) this.logger.warn({ msg: warning });
+    this.logger[this.readiness.warnings.length ? 'warn' : 'info']({
+      mx: this.readiness.mx ? ports.mx : null,
+      submission: this.readiness.submission ? ports.submission : null,
+      smtps: this.readiness.smtps ? ports.smtps : null,
+      tls: hasTls,
+      authUsable,
+      msg: 'SMTP portları hazır',
+    });
   }
 
   _listen(server, port, host, label) {
@@ -252,6 +303,7 @@ class SmtpServer {
       connectionStats: this.connections.stats(),
       listeners: this.servers.map(({ port, label }) => ({ port, mode: label })),
       tls: !!this.tlsOptions,
+      readiness: this.readiness || null,
     };
   }
 }

@@ -52,6 +52,17 @@ class HttpServers {
 
   /* ── yönlendiriciler ───────────────────────────────────────── */
 
+  /**
+   * Ters proxy'nin (Cloudflare) sayfaya enjekte ettiği betiklere izin.
+   *
+   * Liste yapılandırmadan geliyor ve boşaltılabilir — bkz. config.js
+   * `http.cspScriptExtra`. Boşken politika hiç genişlemez.
+   */
+  _cspSources(base, extra) {
+    const additions = (extra || []).filter(Boolean);
+    return additions.length ? `${base} ${additions.join(' ')}` : base;
+  }
+
   buildWebmailRouter() {
     const router = new Router({ logger: this.logger.child('webmail'), config: this.config });
     const deps = { ...this.deps, renderSite: null };
@@ -63,16 +74,21 @@ class HttpServers {
       // stil ve yazı tipi izni veriyordu; o bağımlılık kaldırıldığı için
       // izin de kaldırıldı — bir kimlik sağlayıcının erişilebilirliği posta
       // kutusunun görünümünü belirlememeli.
+      //
+      // Tek istisna Cloudflare'in enjekte ettiği ölçüm betiği: onu biz
+      // koymuyoruz, ters proxy koyuyor ve engellenince konsol her sayfa
+      // yüklemesinde iki ihlal yazıyor. `'unsafe-inline'` YERİNE özet
+      // kullanılıyor — bkz. config.js.
       csp: [
         "default-src 'self'",
-        "script-src 'self'",
+        this._cspSources("script-src 'self'", this.config.http.cspScriptExtra),
         "style-src 'self' 'unsafe-inline'",
         // İleti gövdesindeki gömülü görseller data:/blob: olarak geliyor;
         // uzak görseller sunucuda zaten engelleniyor (bkz. sanitizeHtml).
         "img-src 'self' data: blob:",
         "font-src 'self' data:",
         // Gerçek zamanlı akış aynı kökene bağlanıyor.
-        "connect-src 'self' ws: wss:",
+        this._cspSources("connect-src 'self' ws: wss:", this.config.http.cspConnectExtra),
         "frame-ancestors 'none'",
         "base-uri 'none'",
         "form-action 'self'",
@@ -123,21 +139,30 @@ class HttpServers {
 
   buildSiteRouter() {
     const router = new Router({ logger: this.logger.child('site'), config: this.config });
+    // Kişisel sitede satır içi betik var (public/site/index.html) ve o
+    // sayfanın tamamı bizim; `'unsafe-inline'` burada bilinçli bir tercih.
+    // Webmail'de aynı taviz VERİLMİYOR: orada bir ileti gövdesi ekrana
+    // geliyor ve satır içi betiğe izin vermek, temizlemedeki tek bir
+    // gedik ile XSS demek.
     router.use(securityHeaders({
-      "csp": [
-  "default-src 'self'",
-  "script-src 'self' 'unsafe-inline'",
-  "style-src 'self' 'unsafe-inline'",
-  // Görseller için storage adresin ve Spotify'ın resim CDN'leri:
-  "img-src 'self' data: https://storage.aybars.net.tr https://i.scdn.co https://*.spotifycdn.com",
-  // Fetch/Axios (API) istekleri ve WebSocket için:
-  "connect-src 'self' https://storage.aybars.net.tr https://api.spotify.com",
-  // Eğer Spotify Embed Player (iframe) kullanıyorsan:
-  "frame-src 'self' https://open.spotify.com",
-  // Eğer storage'ından ses veya video çekeceksen (opsiyonel):
-  "media-src 'self' https://storage.aybars.net.tr",
-  "frame-ancestors 'none'"
-].join('; '),
+      csp: [
+        "default-src 'self'",
+        this._cspSources("script-src 'self' 'unsafe-inline'", this.config.http.cspScriptExtra),
+        "style-src 'self' 'unsafe-inline'",
+        // Görseller: kendi storage adresi ve Spotify'ın resim CDN'leri.
+        "img-src 'self' data: https://storage.aybars.net.tr https://i.scdn.co https://*.spotifycdn.com",
+        // Fetch (API) istekleri ve WebSocket.
+        this._cspSources(
+          "connect-src 'self' https://storage.aybars.net.tr https://api.spotify.com",
+          this.config.http.cspConnectExtra,
+        ),
+        // Spotify gömülü oynatıcı (iframe).
+        "frame-src 'self' https://open.spotify.com",
+        "media-src 'self' https://storage.aybars.net.tr",
+        "frame-ancestors 'none'",
+        "base-uri 'none'",
+        "form-action 'self'",
+      ].join('; '),
     }));
     router.use(this._hostGuard('site'));
     router.use(rateLimit(this.generalLimiter, { skip: (ctx) => ctx.pathname.startsWith('/static/') }));

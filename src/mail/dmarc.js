@@ -213,8 +213,12 @@ async function evaluate({ fromDomain, spf = null, dkim = null, resolver = dnsMod
 function authenticationResultsHeader({ hostname, spf = null, dkim = null, dmarc = null, iprev = null, smime = null }) {
   const parts = [hostname];
   if (spf) {
+    // Hangi kimliğin doğrulandığı AÇIKÇA yazılır (RFC 8601 §2.7.2):
+    // `smtp.mailfrom` zarf gönderenidir, `smtp.helo` ise zarf boşken
+    // kullanılan HELO adı. İkisini aynı ada yazmak, geri dönüş iletilerinde
+    // olmayan bir zarf adresini varmış gibi göstermek olurdu.
     const detail = [];
-    if (spf.domain) detail.push(`smtp.mailfrom=${spf.domain}`);
+    if (spf.domain) detail.push(`${spf.identity === 'helo' ? 'smtp.helo' : 'smtp.mailfrom'}=${spf.domain}`);
     parts.push(`spf=${spf.result}${detail.length ? ` ${detail.join(' ')}` : ''}`);
   }
   if (dkim && dkim.results && dkim.results.length) {
