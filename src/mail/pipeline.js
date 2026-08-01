@@ -201,25 +201,46 @@ class MailPipeline {
         msg: 'SPF geçmedi',
       });
     }
+    // ── DKIM BAŞARISIZLIĞI `warn` SEVİYESİNDE ─────────────────────────
+    // Eskiden `debug`di, yani üretimde (info) HİÇ GÖRÜNMÜYORDU. "dkim=fail"
+    // yalnızca başlıkta kalıyor ve nedeni ancak iletiyi elle dışa aktarıp
+    // `fitfak-mail-verify` ile koşturarak öğrenilebiliyordu.
+    //
+    // Kayda yazılan alanlar, o aracı çalıştırmadan cevap verebilecek
+    // olanlar: gövde özeti tuttu mu (tutmadıysa gövde yolda değişmiş),
+    // hangi başlıklar imzalanmış (biri yeniden yazılmışsa imza düşer),
+    // DNS kaydı bulundu mu.
     for (const signature of dkimResult.results || []) {
       if (signature.result === 'pass') continue;
-      this.logger.debug({
+      const detail = signature.detail || {};
+      this.logger.warn({
         d: signature.domain,
         s: signature.selector,
         a: signature.algorithm,
         result: signature.result,
         bodyHashMatch: signature.bodyHashMatch,
+        canonicalization: detail.canonicalization,
+        dnsName: detail.dnsName,
+        dnsRecordFound: detail.dnsRecordFound,
+        declaredBodyHash: detail.declaredBodyHash ? String(detail.declaredBodyHash).slice(0, 16) : undefined,
+        computedBodyHash: detail.computedBodyHash ? String(detail.computedBodyHash).slice(0, 16) : undefined,
+        signedHeaders: detail.signedHeaders,
+        signingInputBytes: detail.signingInputBytes,
         reason: signature.reason,
-        detail: signature.detail || undefined,
-        msg: 'DKIM imzası geçmedi',
+        msg: 'DKIM imzası geçmedi — ayrıntı için: fitfak-mail-verify <ileti.eml>',
       });
     }
-    if (out.dmarc && out.dmarc.result !== 'pass') {
-      this.logger.debug({
+    if (out.dmarc && out.dmarc.result !== 'pass' && out.dmarc.result !== 'none') {
+      // `alignment` bloğu hangi TARAFIN hizalanmadığını söylüyor:
+      // `spf: 'fail_unaligned'` SPF geçti ama alan tutmadı demek — ki bu,
+      // `spf.domain`in yanlış alanı bildirmesiyle her Gmail iletisinde
+      // oluyordu (bkz. src/mail/spf.js içindeki not).
+      this.logger.warn({
         fromDomain,
         dmarc: out.dmarc.result,
         disposition: out.dmarc.disposition,
         alignment: out.dmarc.alignment,
+        policy: out.dmarc.policy ? out.dmarc.policy.effectivePolicy : null,
         reason: out.dmarc.reason,
         msg: 'DMARC geçmedi',
       });

@@ -270,6 +270,104 @@ runner.test('SPF: zarf boşken HELO kimliği bildirilir', async () => {
   assertEqual(result.identity, 'helo', 'kimlik HELO olmalı');
 });
 
+/* ── DKIM: gerçek dünyadaki başlık katlaması ───────────────── */
+
+runner.test('DKIM: Gmail biçimindeki katlanmış imza doğrulanır', async () => {
+  // ── NEDEN BU TEST VAR ──────────────────────────────────────────────
+  // Gelen Gmail iletilerinde `dkim=fail header.d=gmail.com` görülüyordu.
+  // Gmail'in imzası iki yerde katlanıyor ve ikisi de kanoniklik açısından
+  // tuzak:
+  //
+  //   h=content-type:to:subject:…:from:to
+  //    :cc:subject:…:content-type;
+  //
+  // Katlama `:` SONRASINDA yapılmış; açıldığında araya BİR BOŞLUK giriyor
+  // ve relaxed kanoniklik o boşluğu KORUYOR (silmiyor, tek boşluğa
+  // indiriyor). İmzalayan taraf da aynı dizgeyi görmüş olmalı — silersek
+  // ya da iki boşluk bırakırsak imza tutmaz.
+  //
+  // Ayrıca `h=` listesi aşırı-imzalama (oversigning) içeriyor: `from`,
+  // `to`, `subject` iki kez geçiyor ama iletide birer tane var. İkinci
+  // geçiş BOŞ olarak kanonikleşmek zorunda (RFC 6376 §5.4.2).
+  const dkim = require('../src/mail/dkim');
+  const kp = crypto.generateKeyPairSync('rsa', { modulusLength: 2048 });
+  const privPem = kp.privateKey.export({ type: 'pkcs8', format: 'pem' });
+  const pubB64 = kp.publicKey.export({ type: 'spki', format: 'der' }).toString('base64');
+
+  const boundary = '0000000000005f453c0657ed41e3';
+  const body = `--${boundary}\r\n`
+    + 'Content-Type: text/plain; charset="UTF-8"\r\n\r\n'
+    + 'merhaba\r\n'
+    + `--${boundary}\r\n`
+    + 'Content-Type: application/pdf; name="buyuk.pdf"\r\n'
+    + 'Content-Transfer-Encoding: base64\r\n'
+    + 'Content-Disposition: attachment; filename="buyuk.pdf"\r\n\r\n'
+    + `${Buffer.from('%PDF-1.4 sahte icerik').toString('base64')}\r\n`
+    + `--${boundary}--\r\n`;
+
+  const headers = 'MIME-Version: 1.0\r\n'
+    + 'From: =?UTF-8?B?QXliYXJzIFnEsWxkxLFyxLFt?= <aybarsyildirim.mail@gmail.com>\r\n'
+    + 'Date: Fri, 31 Jul 2026 22:32:40 +0300\r\n'
+    + 'Message-ID: <CAAH6OZ3CGoJW2QWdDpsUn4QZL=wrLH0d-pNJUnDQpaRD_62jQg@mail.gmail.com>\r\n'
+    + 'Subject: Test\r\n'
+    + 'To: Fitfak Mail <network@fitfak.net>\r\n'
+    + `Content-Type: multipart/mixed; boundary="${boundary}"\r\n`;
+
+  const unsigned = Buffer.from(`${headers}\r\n${body}`, 'binary');
+  const bh = dkim.bodyHash(body, { canon: 'relaxed', hash: 'sha256' });
+  const foldedList = 'content-type:to:subject:message-id:date:from:mime-version:from:to'
+    + '\r\n         :cc:subject:date:message-id:reply-to:content-type';
+  const tags = 'v=1; a=rsa-sha256; c=relaxed/relaxed;\r\n'
+    + '        d=gmail.com; s=20251104; t=1785526376; x=1786131176; darn=fitfak.net;\r\n'
+    + `        h=${foldedList};\r\n`
+    + `        bh=${bh};\r\n`
+    + '        b=';
+
+  const flatNames = ('content-type:to:subject:message-id:date:from:mime-version:from:to'
+    + ':cc:subject:date:message-id:reply-to:content-type').split(':');
+  const parsed = dkim.splitMessage(unsigned);
+  const remaining = new Map();
+  for (const h of parsed.headers) {
+    if (!remaining.has(h.name)) remaining.set(h.name, []);
+    remaining.get(h.name).push(h);
+  }
+  for (const list of remaining.values()) list.reverse();
+  const parts = [];
+  for (const name of flatNames) {
+    const list = remaining.get(name);
+    parts.push(!list || !list.length ? `${name}:` : dkim.canonicalizeHeaderRelaxed(list.shift().raw));
+  }
+  parts.push(dkim.canonicalizeHeaderRelaxed(`DKIM-Signature: ${tags}`));
+  const signature = crypto
+    .sign('sha256', Buffer.from(parts.join('\r\n'), 'binary'), crypto.createPrivateKey(privPem))
+    .toString('base64');
+
+  const message = Buffer.from(
+    `DKIM-Signature: ${tags}${signature.match(/.{1,60}/g).join('\r\n         ')}\r\n${headers}\r\n${body}`,
+    'binary',
+  );
+
+  const result = await dkim.verifyMessage(message, {
+    diagnostics: true,
+    keyLookup: async () => [`v=DKIM1; k=rsa; p=${pubB64}`],
+  });
+  assertEqual(result.overall, 'pass', `doğrulanmalıydı: ${result.reason}`);
+  assertEqual(result.results[0].bodyHashMatch, true, 'gövde özeti tutmalı');
+});
+
+runner.test('DKIM: X-Google-DKIM-Signature gerçek imza sayılmaz', async () => {
+  // `X-Google-DKIM-Signature` d=1e100.net taşıyor ve DKIM-Signature DEĞİL.
+  // Onu imza sanmak, alan sahibi olmayan bir alan için sonuç üretmek olur.
+  const dkim = require('../src/mail/dkim');
+  const message = Buffer.from(
+    'X-Google-DKIM-Signature: v=1; a=rsa-sha256; d=1e100.net; s=20251104; b=AAAA\r\n'
+    + 'From: a@gmail.com\r\nSubject: t\r\n\r\ngövde\r\n', 'binary',
+  );
+  const result = await dkim.verifyMessage(message, { keyLookup: async () => [] });
+  assertEqual(result.overall, 'none', 'gerçek DKIM-Signature yok sayılmalı');
+  assertEqual(result.results.length, 0, 'sonuç üretilmemeli');
+});
+
 /* ── PKCS#12 ───────────────────────────────────────────────── */
 
 function opensslAvailable() {
