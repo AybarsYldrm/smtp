@@ -83,6 +83,144 @@ for (const algorithm of ['rsa', 'ed25519']) {
   });
 }
 
+/**
+ * h= listesinde OLMAYAN ya da TEKRARLANAN bir başlık HİÇBİR ŞEY katmaz.
+ *
+ * ── BİLDİRİLEN ÇELİŞKİ ───────────────────────────────────────────────────
+ * Kendi doğrulayıcımız giden iletiye `pass` diyordu, Gmail aynı iletiye
+ * `dkim=fail`. Sebep DNS önbelleği değildi: imzalanan GİRDİ yanlıştı.
+ *
+ * RFC 6376 §3.5, h= listesinde olup iletide bulunmayan bir başlık için
+ * "treated as the null input, **including the header field name, the
+ * separating colon**, the header field value, and any CRLF terminator"
+ * diyor — yani hiçbir şey eklenmez. Bizim kod oraya `from:` yazıyordu ve
+ * imzalanan girdiye GERÇEK bir satır ekliyordu (567 bayt; doğrusu 560).
+ *
+ * Aynı hata iki tarafta da olduğu için imzalayıcımız ile doğrulayıcımız
+ * birbiriyle tutarlıydı ve hata yalnızca dışarıya karşı görünüyordu — hem
+ * giden postada (Gmail fail) hem gelen postada (Gmail ve MxToolbox
+ * imzalarını reddediyorduk).
+ */
+runner.test('DKIM: oversign edilmiş h= imzayı bozmaz (Gmail uyumu)', async () => {
+  const keys = dkim.generateKeyPair({ algorithm: 'rsa' });
+  const signed = dkim.signMessage({
+    rawMessage: MIME_SAMPLE, domain: 'fitfak.net', selector: 'mail',
+    privateKeyPem: keys.privateKeyPem, algorithm: keys.algorithm,
+  });
+
+  const hTag = signed.signatureHeader.match(/h=([\s\S]*?);/)[1].replace(/\s+/g, '');
+  const names = hTag.split(':');
+  assertEqual(names.filter((n) => n === 'from').length, 2, 'from oversign edilmeli');
+
+  // İmzalanan girdiyi ELLE, RFC'ye göre kur: ikinci `from` için hiçbir şey
+  // eklenmez. Bu satırlar bilerek kodumuzu çağırmadan yazıldı — uygulama
+  // standarttan saparsa bu test düşer.
+  const { headers } = dkim.splitMessage(signed.rawMessage);
+  const sig = headers.find((h) => h.name === 'dkim-signature');
+  const selfNoB = sig.raw.replace(/([;\s]b=)[^;]*/i, '$1');
+
+  const parts = [];
+  for (const name of names) {
+    const found = headers.find((h) => h.name === name);
+    // Tekrar eden ad ikinci kez geçildiğinde ve iletide karşılığı
+    // kalmadığında: hiçbir şey.
+    if (!found || parts.some((p) => p.startsWith(`${name}:`))) continue;
+    parts.push(dkim.canonicalizeHeaderRelaxed(found.raw));
+  }
+  parts.push(dkim.canonicalizeHeaderRelaxed(selfNoB));
+  const expected = Buffer.from(parts.join('\r\n'), 'binary');
+
+  const tags = dkim.parseTagList(sig.raw.slice(sig.raw.indexOf(':') + 1));
+  const signature = Buffer.from(String(tags.b).replace(/\s+/g, ''), 'base64');
+  const publicKeyPem = crypto.createPublicKey(keys.privateKeyPem)
+    .export({ type: 'spki', format: 'pem' });
+
+  assert(
+    crypto.verify('rsa-sha256', expected, publicKeyPem, signature),
+    'imza, RFC 6376 §3.5\'e göre kurulmuş girdiyle DOĞRULANMALI — '
+    + 'aksi hâlde Gmail dkim=fail der',
+  );
+
+  // Eski (hatalı) girdi artık tutmamalı.
+  const buggy = Buffer.from([...parts.slice(0, -1), 'from:', parts[parts.length - 1]].join('\r\n'), 'binary');
+  assert(
+    !crypto.verify('rsa-sha256', buggy, publicKeyPem, signature),
+    'yok olan başlık için `from:` satırı ekleyen eski girdi ARTIK tutmamalı',
+  );
+});
+
+/**
+ * BAĞIMSIZ (yabancı) imzalayıcı.
+ *
+ * Kendi `signMessage`'ımızı kullanmak, gelen posta uyumunu test etmez: iki
+ * taraf da aynı koddan geçtiği için aynı hatayı yapar ve test yeşil kalır —
+ * bildirilen arıza tam olarak buydu. Bu yardımcı, DKIM-Signature başlığının
+ * METNİNİ çağıranın verdiği gibi kurar (h= listesini olduğu gibi yazar) ve
+ * imzalanan girdiyi RFC 6376'ya göre elle hesaplar. Böylece Gmail ve
+ * MxToolbox'ın gerçekte ürettiği biçimler taklit edilebiliyor.
+ */
+function foreignSign(rawMessage, { hTagText, privateKeyPem, domain = 'example.com', selector = 'sel' }) {
+  const { headers, body } = dkim.splitMessage(Buffer.from(rawMessage, 'binary'));
+  const bh = dkim.bodyHash(body, { canon: 'relaxed', hash: 'sha256' });
+
+  const sigText = `DKIM-Signature: v=1; a=rsa-sha256; c=relaxed/relaxed; d=${domain}; s=${selector};`
+    + ` t=${Math.floor(Date.now() / 1000)}; h=${hTagText}; bh=${bh}; b=`;
+
+  // RFC 6376 §5.4.2 + §3.5: adlar alttan tüketilir; karşılığı kalmayan ad
+  // HİÇBİR ŞEY katmaz.
+  const remaining = new Map();
+  for (const h of headers) {
+    if (!remaining.has(h.name)) remaining.set(h.name, []);
+    remaining.get(h.name).push(h);
+  }
+  for (const list of remaining.values()) list.reverse();
+
+  const parts = [];
+  for (const name of hTagText.split(':').map((s) => s.trim().toLowerCase()).filter(Boolean)) {
+    const list = remaining.get(name);
+    if (!list || !list.length) continue;
+    parts.push(dkim.canonicalizeHeaderRelaxed(list.shift().raw));
+  }
+  parts.push(dkim.canonicalizeHeaderRelaxed(sigText));
+
+  const signature = crypto.sign('sha256', Buffer.from(parts.join('\r\n'), 'binary'), privateKeyPem);
+  return `${sigText}${signature.toString('base64')}\r\n${rawMessage}`;
+}
+
+runner.test('DKIM: Gmail biçimli h= (tekrarlı + iletide olmayan adlar) doğrulanır', async () => {
+  const keys = dkim.generateKeyPair({ algorithm: 'rsa' });
+  // Gmail'in gerçekten yayımladığı biçim: content-type/to/subject/date/
+  // message-id/from tekrar ediyor, cc ve reply-to ise bu iletide YOK.
+  const hTag = 'content-type:to:subject:message-id:date:from:mime-version:from:to'
+    + ':cc:subject:date:message-id:reply-to:content-type';
+
+  const message = foreignSign(MIME_SAMPLE, {
+    hTagText: hTag, privateKeyPem: keys.privateKeyPem, domain: 'gmail.com', selector: '20251104',
+  });
+
+  const verdict = await dkim.verifyMessage(Buffer.from(message, 'binary'), {
+    keyLookup: async () => [dkim.dnsRecordFromPrivateKey(keys.privateKeyPem)],
+  });
+  assertEqual(verdict.overall, 'pass',
+    `Gmail biçimli imza kabul edilmeli: ${verdict.reason || ''}`);
+});
+
+runner.test('DKIM: MxToolbox biçimli h= (iki nokta sonrası boşluklu) doğrulanır', async () => {
+  const keys = dkim.generateKeyPair({ algorithm: 'rsa' });
+  // MxToolbox/Mailgun biçimi: ayırıcıdan sonra boşluk ve tekrarlanan adlar.
+  const hTag = 'Message-Id: To: To: From: From: Subject: Subject: Content-Type: Mime-Version: Date: Sender: Sender';
+
+  const message = foreignSign(MIME_SAMPLE, {
+    hTagText: hTag, privateKeyPem: keys.privateKeyPem, domain: 'mxtoolbox.com', selector: 'mailo',
+  });
+
+  const verdict = await dkim.verifyMessage(Buffer.from(message, 'binary'), {
+    keyLookup: async () => [dkim.dnsRecordFromPrivateKey(keys.privateKeyPem)],
+  });
+  assertEqual(verdict.overall, 'pass',
+    `MxToolbox biçimli imza kabul edilmeli: ${verdict.reason || ''}`);
+});
+
 runner.test('DKIM: h= listesi bir adın ortasından katlanmış imza yine okunur', async () => {
   // Başka bir imzalayıcı aynı hatayı yapmış olabilir. Boşlukları atarak
   // okumak, o imzaları kurtarıyor; başlık adları boşluk içeremediği için
@@ -339,10 +477,87 @@ runner.test('DMARC: pct dışında kalan bir kademe düşürülür', async () =>
 
 /* ── S/MIME ────────────────────────────────────────────────── */
 
+/**
+ * DOĞRULAMA, @fitfak/ssl OLMADAN da çalışmak zorunda.
+ *
+ * İmza ÜRETMEK sertifika profilleri ve OID kayıt defteri istiyor; imza
+ * DOĞRULAMAK yalnızca DER okumak ve `crypto.verify` çağırmak — ikisi de
+ * pakette zaten var. Buna rağmen doğrulama da aynı `require` üzerinden
+ * gidiyordu, yani @fitfak/ssl kurulu değilken GELEN bir S/MIME imzası hiç
+ * denetlenemiyordu. Gelen posta doğrulamasının, ancak sertifika ÜRETEBİLEN
+ * bir kurulumda çalışması için hiçbir sebep yok.
+ *
+ * Bu paket bilerek OpenSSL ile üretilmiş bir CMS kullanıyor: hem @fitfak/ssl'e
+ * dokunmuyor, hem de kendi ürettiğimizi kendimizin okuduğu döngüsel testten
+ * kaçınıp gerçek bir üreticiyle uyumu ölçüyor.
+ */
+{
+  const cp = require('node:child_process');
+  const fsMod = require('node:fs');
+  const osMod = require('node:os');
+  const pathMod = require('node:path');
+  const hasOpenssl = cp.spawnSync('openssl', ['version'], { encoding: 'utf8' }).status === 0;
+
+  runner.test('S/MIME: OpenSSL üretimi imza @fitfak/ssl OLMADAN doğrulanır', () => {
+    if (!hasOpenssl) return;
+    const dir = fsMod.mkdtempSync(pathMod.join(osMod.tmpdir(), 'fitmail-cms-'));
+    try {
+      const keyFile = pathMod.join(dir, 'k.pem');
+      const certFile = pathMod.join(dir, 'c.pem');
+      const contentFile = pathMod.join(dir, 'content.txt');
+      const sigFile = pathMod.join(dir, 'sig.der');
+
+      const gen = cp.spawnSync('openssl', [
+        'req', '-x509', '-newkey', 'rsa:2048', '-nodes',
+        '-keyout', keyFile, '-out', certFile, '-days', '30',
+        '-subj', '/CN=Imzalayan/emailAddress=imza@fitfak.net',
+        '-addext', 'subjectAltName=email:imza@fitfak.net',
+      ], { encoding: 'utf8' });
+      assertEqual(gen.status, 0, `sertifika üretilemedi: ${gen.stderr}`);
+
+      // İmzalanan baytlar, MIME parçasının başlıkları DÂHİL tam hâli ve CRLF.
+      const contentPartLocal = [
+        'Content-Type: text/plain; charset=utf-8',
+        '',
+        'OpenSSL tarafindan imzalanmis icerik.',
+      ].join('\r\n');
+      fsMod.writeFileSync(contentFile, Buffer.from(contentPartLocal, 'binary'));
+
+      const sign = cp.spawnSync('openssl', [
+        'cms', '-sign', '-binary', '-in', contentFile, '-signer', certFile,
+        '-inkey', keyFile, '-outform', 'DER', '-out', sigFile, '-md', 'sha256',
+      ], { encoding: 'utf8' });
+      assertEqual(sign.status, 0, `CMS imzalanamadı: ${sign.stderr}`);
+
+      const verdict = smime.verifyDetached({
+        content: Buffer.from(contentPartLocal, 'binary'),
+        signatureDer: fsMod.readFileSync(sigFile),
+        expectedAddress: 'imza@fitfak.net',
+      });
+
+      assertEqual(verdict.valid, true, `OpenSSL imzası doğrulanmalı: ${verdict.reason || ''}`);
+      assertEqual(verdict.digestMatch, true, 'içerik özeti uyuşmalı');
+      assertEqual(verdict.addressMatch, true, 'SAN adresi eşleşmeli');
+      assertEqual(verdict.timeValid, true, 'sertifika süresi içinde olmalı');
+      assert(verdict.signer && verdict.signer.subject.includes('Imzalayan'), 'imzalayan bildirilmeli');
+
+      // İçerik değişirse reddedilmeli — imzanın bu iletiye ait olduğunu
+      // gösteren tek şey bu.
+      const tampered = smime.verifyDetached({
+        content: Buffer.from(contentPartLocal.replace('imzalanmis', 'degistirilmis'), 'binary'),
+        signatureDer: fsMod.readFileSync(sigFile),
+      });
+      assertEqual(tampered.valid, false, 'kurcalanmış içerik reddedilmeli');
+    } finally {
+      fsMod.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+}
+
 const smimeAvailable = csrModule.isAvailable();
 
 if (!smimeAvailable) {
-  runner.test('S/MIME testleri atlandı (@fitfak/ssl yok)', () => {
+  runner.test('S/MIME imzalama testleri atlandı (@fitfak/ssl yok — doğrulama yine denetlendi)', () => {
     assert(true, 'npm run link:deps ile etkinleşir');
   });
 } else {
