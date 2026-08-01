@@ -193,7 +193,7 @@ class MailSigner {
    *
    * Hiçbir şey ÜRETMEZ ve hiçbir şey YAZMAZ; yalnızca durumu bildirir.
    */
-  async verifyDkimPublication(domain, { resolver = null } = {}) {
+  async verifyDkimPublication(domain, { resolver = null, timeoutMs = 5000 } = {}) {
     const peek = await this.peekDkimKey(domain);
     const result = {
       domain,
@@ -209,7 +209,11 @@ class MailSigner {
     let published = [];
     try {
       const resolveTxt = resolver || require('node:dns').promises.resolveTxt;
-      const rows = await resolveTxt(dnsName);
+      // Bu denetim AÇILIŞTA çalışıyor. Süre sınırı olmayan bir DNS sorgusu,
+      // çözücü yanıt vermediğinde posta sunucusunun açılışını süresiz
+      // bekletirdi — ve bir bilgi denetimi, hizmetin ayağa kalkmasını
+      // engelleyecek kadar önemli değil.
+      const rows = await withTimeout(resolveTxt(dnsName), timeoutMs, dnsName);
       published = rows.map((chunks) => (Array.isArray(chunks) ? chunks.join('') : String(chunks)));
     } catch (err) {
       result.dns = err.code === 'ENOTFOUND' || err.code === 'ENODATA' ? 'absent' : 'lookup-failed';
@@ -303,6 +307,24 @@ class MailSigner {
     if (domain) this.dkimCache.delete(String(domain).toLowerCase());
     if (!address && !domain) { this.smimeCache.clear(); this.dkimCache.clear(); }
   }
+}
+
+/** Bir sözü süre sınırına bağlar; zaman aşımı DNS hatası gibi kodlanır. */
+function withTimeout(promise, ms, label) {
+  if (!(ms > 0)) return promise;
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    // Zamanlayıcı BİLEREK unref edilmiyor. Unref edilmiş bir zamanlayıcı, olay
+    // döngüsünü ayakta tutan başka bir şey yoksa süreci sessizce bitirir: söz
+    // ne çözülür ne reddedilir, çağıran da hiçbir sonuç almaz. Zaman aşımının
+    // güvenilir olması, birkaç saniyelik bir tutamağa değer.
+    timer = setTimeout(() => {
+      const err = new Error(`DNS zaman aşımı (${label}, ${ms}ms)`);
+      err.code = 'ETIMEOUT';
+      reject(err);
+    }, ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
 }
 
 /**
