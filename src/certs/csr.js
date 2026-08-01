@@ -163,7 +163,153 @@ function inspectRequest(csrPem) {
   };
 }
 
+/* ── @fitfak/ssl olmadan PKCS#10 ──────────────────────────────── */
+
+/**
+ * @fitfak/database'in CsrProvider arayüzünü YALNIZCA Node'un kendi crypto'suyla
+ * karşılar.
+ *
+ * ── NEDEN GEREKLİ ────────────────────────────────────────────────────────
+ * `db/driver-fitfak.js` uzak (mTLS) yolda @fitfak/ssl yoksa buraya düşüyor ve
+ * bunu bilerek yapıyor: "tek bir paketin eksikliği sistemi başlatılamaz hâle
+ * getirmemeli". Ama çağırdığı `createLocalCsrProvider` HİÇ YAZILMAMIŞTI, yani
+ * o yol ilk satırında `createLocalCsrProvider is not a function` ile
+ * düşüyordu. Sonuç, tam olarak engellenmek istenen şeydi: @fitfak/ssl kurulu
+ * değilken uzak veritabanına bağlanan bir posta sunucusu AÇILAMIYORDU.
+ *
+ * Sağlayıcının sözleşmesi (csr-provider.js):
+ *   generateKeyPair()                        -> { privateKeyPem, publicKeyPem, … }
+ *   createCsr({ keyPair, subject, altNames }) -> csrPem
+ *
+ * Bu ikinci bir PKI değil: yalnızca bir CertificationRequest kodlar ve imzalar.
+ * Sertifika üretmiyor, doğrulamıyor, profil uygulamıyor — onlar @fitfak/ssl'in
+ * işi ve orada kalıyor.
+ */
+function createLocalCsrProvider({ algorithm = 'ec', namedCurve = 'prime256v1', modulusLength = 2048 } = {}) {
+  const { SEQ, SET, OID, CTX, INT, NULL, tlv, TAG, derToPem } = require('./asn1');
+
+  // PKCS#10, imzalanan yapıyı (CertificationRequestInfo) DER olarak istiyor;
+  // Node bize SPKI verdiği için açık anahtar oraya olduğu gibi gömülüyor.
+  const SUBJECT_OIDS = {
+    CN: '2.5.4.3', C: '2.5.4.6', ST: '2.5.4.8', L: '2.5.4.7',
+    O: '2.5.4.10', OU: '2.5.4.11', emailAddress: '1.2.840.113549.1.9.1',
+  };
+  const SIG_OIDS = {
+    // ecdsa-with-SHA256 — EC'de parametre alanı BULUNMAZ (NULL bile değil);
+    // NULL koymak bazı doğrulayıcılarda imzayı geçersiz kılıyor.
+    ec: { oid: '1.2.840.10045.4.3.2', params: null },
+    // sha256WithRSAEncryption — RSA'da parametre alanı NULL olmak ZORUNDA.
+    rsa: { oid: '1.2.840.113549.1.1.11', params: 'null' },
+  };
+
+  const IA5_STRING = 0x16; // asn1.js'in TAG tablosunda yok; PKCS#9 emailAddress bunu ister.
+  function utf8(text) { return tlv(TAG.UTF8_STRING, Buffer.from(String(text), 'utf8')); }
+  function ia5(text) { return tlv(IA5_STRING, Buffer.from(String(text), 'utf8')); }
+
+  function subjectName(subject) {
+    const rdns = [];
+    for (const [key, value] of Object.entries(subject || {})) {
+      const oid = SUBJECT_OIDS[key];
+      if (!oid || value == null || value === '') continue;
+      // emailAddress tarihsel olarak IA5String; diğerleri UTF8String.
+      const encoded = key === 'emailAddress' ? ia5(value) : utf8(value);
+      rdns.push(SET(SEQ(OID(oid), encoded)));
+    }
+    return SEQ(...rdns);
+  }
+
+  function generalNames(altNames) {
+    const entries = [];
+    for (const raw of altNames || []) {
+      const value = String(raw || '').trim();
+      if (!value) continue;
+      if (value.includes('@')) {
+        entries.push(CTX(1, Buffer.from(value, 'utf8'), { explicit: false })); // rfc822Name
+      } else if (/^\d{1,3}(\.\d{1,3}){3}$/.test(value)) {
+        entries.push(CTX(7, Buffer.from(value.split('.').map(Number)), { explicit: false })); // iPAddress
+      } else {
+        entries.push(CTX(2, Buffer.from(value, 'utf8'), { explicit: false })); // dNSName
+      }
+    }
+    return entries.length ? SEQ(...entries) : null;
+  }
+
+  return {
+    name: 'local-pkcs10',
+
+    async generateKeyPair() {
+      if (algorithm === 'rsa') {
+        const { publicKey, privateKey } = crypto.generateKeyPairSync('rsa', { modulusLength });
+        return {
+          keyType: 'rsa',
+          privateKey,
+          publicKey,
+          privateKeyPem: privateKey.export({ type: 'pkcs8', format: 'pem' }),
+          publicKeyPem: publicKey.export({ type: 'spki', format: 'pem' }),
+          publicKeySpkiDer: publicKey.export({ type: 'spki', format: 'der' }),
+        };
+      }
+      const { publicKey, privateKey } = crypto.generateKeyPairSync('ec', { namedCurve });
+      return {
+        keyType: 'ec',
+        privateKey,
+        publicKey,
+        privateKeyPem: privateKey.export({ type: 'pkcs8', format: 'pem' }),
+        publicKeyPem: publicKey.export({ type: 'spki', format: 'pem' }),
+        publicKeySpkiDer: publicKey.export({ type: 'spki', format: 'der' }),
+      };
+    },
+
+    async createCsr({ keyPair, subject = {}, altNames = [] }) {
+      const keyType = keyPair.keyType === 'rsa' ? 'rsa' : 'ec';
+      const spki = keyPair.publicKeySpkiDer
+        || crypto.createPublicKey(keyPair.publicKeyPem).export({ type: 'spki', format: 'der' });
+
+      // attributes [0] IMPLICIT SET OF Attribute.
+      //
+      // IMPLICIT olduğu için [0] etiketi SET'in YERİNE geçer, onu sarmaz —
+      // içeriğe ayrıca bir SET (ya da SEQUENCE) koymak, OpenSSL'in
+      // "wrong tag / nested asn1 error" ile reddettiği fazladan bir katman
+      // üretiyor. Bu yüzden Attribute doğrudan [0]'ın içinde duruyor.
+      const sanNames = generalNames(altNames);
+      const attributes = sanNames
+        ? CTX(0, SEQ(                     // Attribute
+          OID('1.2.840.113549.1.9.14'),   // extensionRequest
+          SET(SEQ(SEQ(                    // SET { Extensions { Extension } }
+            OID('2.5.29.17'),             // subjectAltName
+            tlv(TAG.OCTET_STRING, sanNames),
+          ))),
+        ), { explicit: false, constructed: true })
+        : CTX(0, Buffer.alloc(0), { explicit: false, constructed: true });
+
+      const requestInfo = SEQ(
+        INT(0n),                 // version v1
+        subjectName(subject),
+        spki,                    // SubjectPublicKeyInfo, already a complete SEQUENCE
+        attributes,
+      );
+
+      const privateKey = keyPair.privateKey || crypto.createPrivateKey(keyPair.privateKeyPem);
+      const signature = crypto.sign('sha256', requestInfo, keyType === 'ec'
+        ? { key: privateKey, dsaEncoding: 'der' }
+        : privateKey);
+
+      const sig = SIG_OIDS[keyType];
+      const algId = sig.params === 'null' ? SEQ(OID(sig.oid), NULL()) : SEQ(OID(sig.oid));
+
+      const csrDer = SEQ(
+        requestInfo,
+        algId,
+        // BIT STRING: ilk bayt kullanılmayan bit sayısı, imzada her zaman 0.
+        tlv(TAG.BIT_STRING, Buffer.concat([Buffer.from([0x00]), signature])),
+      );
+      return derToPem(csrDer, 'CERTIFICATE REQUEST');
+    },
+  };
+}
+
 module.exports = {
   isAvailable, loadSsl, generateKeyMaterial,
   createSmimeRequest, createClientRequest, inspectRequest,
+  createLocalCsrProvider,
 };

@@ -46,14 +46,21 @@ function registerStatusRoutes(router, deps) {
       stores.dnsAudit.list().catch(() => []),
     ]);
 
+    // Kasaya BAKILIR, üretilmez: bir durum sayfasını açmanın yan etkisi
+    // anahtar üretmek olmamalı. `dkimKey: 'missing'` burada anlamlı bir
+    // cevap — "anahtar yok" bilgisi, sayfanın gösterebileceği en önemli şey.
     const domains = [];
     for (const domain of config.domains) {
-      const record = await signer.dkimDnsRecord(domain.name).catch(() => null);
+      const key = await signer.peekDkimKey(domain.name).catch(() => null);
       domains.push({
         name: domain.name,
         receive: domain.receive,
+        sign: domain.sign,
+        manageDns: domain.manageDns,
         dkimSelector: domain.dkimSelector,
-        dkimRecord: record ? { name: record.name, value: record.value } : null,
+        dkimKey: key && key.present ? 'present' : (key && key.unreadable ? 'unreadable' : 'missing'),
+        dkimKeyVersion: key && key.present ? key.version : null,
+        dkimRecord: key && key.present ? { name: key.dnsName, value: key.dnsValue } : null,
       });
     }
 

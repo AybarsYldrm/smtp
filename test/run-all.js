@@ -20,6 +20,8 @@ const SUITES = [
   ['auth-identity', 'IdP kimlik doğrulama ve kimlik bağları'],
   ['http-api', 'HTTP API, gerçek zamanlı, kişisel site'],
   ['driver-shapes', 'sürücü şekilleri, kasa zarfı, PKCS#12'],
+  ['outbound-delivery', 'giden teslimat: gerçek kuyruk, iki sürücü, sahte MX'],
+  ['dkim-dns', 'DKIM kasa/DNS hizası ve DNS denetim kapsamı'],
 ];
 
 const only = process.argv.slice(2).filter((a) => !a.startsWith('-'));

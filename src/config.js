@@ -61,6 +61,23 @@ function pick(envKey, filePath, fallback) {
   return cur !== undefined ? cur : fallback;
 }
 
+/**
+ * `pick` gibi, ama AÇIKÇA BOŞ bırakılmış bir ortam değişkenini "verilmemiş"
+ * saymaz.
+ *
+ * `pick` boş dizgiyi yok sayıyor ve öntanımlıya düşüyor. Öntanımlısı DOLU olan
+ * bir ayarda bunun sonucu şu: ayarı KAPATMANIN hiçbir yolu kalmıyor.
+ * `db.remoteTarget` tam olarak böyleydi — öntanımlı `https://localhost:51572`
+ * olduğu için `FITFAK_MAIL_DB_TARGET=` vermek de, boş vermek de uzak kipi
+ * seçiyordu; gömülü motoru ortam değişkenleriyle seçmek mümkün değildi.
+ *
+ * Boş dizgi burada geçerli bir değer: "bu ayar kapalı".
+ */
+function pickAllowEmpty(envKey, filePath, fallback) {
+  if (process.env[envKey] != null) return process.env[envKey];
+  return pick(envKey, filePath, fallback);
+}
+
 function bool(envKey, filePath, fallback = false) {
   const v = pick(envKey, filePath, undefined);
   if (v === undefined || v === '') return fallback;
@@ -101,24 +118,48 @@ const PUBLIC_DIR = path.resolve(pick('FITFAK_MAIL_PUBLIC_DIR', 'publicDir', path
 const PRIMARY_DOMAIN = lower(pick('FITFAK_MAIL_DOMAIN', 'mail.domain', 'fitfak.net'));
 const MAIL_HOSTNAME = lower(pick('FITFAK_MAIL_HOSTNAME', 'mail.hostname', `mail.${PRIMARY_DOMAIN}`));
 
+/**
+ * Posta alan adları.
+ *
+ * ── SİTE ALAN ADI BURAYA GİRMEZ ──────────────────────────────────────────
+ * Önceki sürüm site alan adını (`site.domain`, öntanımlı aybars.net.tr) posta
+ * alan adı listesine KENDİLİĞİNDEN ekliyordu. Sonucu şuydu: o alan adı için
+ * SPF, DKIM ve DMARC kayıtları bekleniyor, DNS denetiminde "eksik" olarak
+ * raporlanıyor, `dns.autoApply` açıkken de Cloudflare'e yazılıyordu — hiç
+ * istenmemiş olmasına rağmen. Bir alan adının web sitesi barındırması, onun
+ * posta alan adı olduğu anlamına gelmez.
+ *
+ * Artık yalnızca AÇIKÇA sayılan alan adları posta alan adıdır. Site alan
+ * adından posta göndermek isteniyorsa `mail.domains` listesine elle eklenir
+ * ve o zaman kayıtları da bilinçli olarak beklenir.
+ *
+ * Alan adı başına üç bağımsız anahtar:
+ *   receive    — MX bu sunucuyu gösterir, gelen posta kabul edilir
+ *   sign       — bu alan adından çıkan posta DKIM ile imzalanır (anahtar üretilir)
+ *   manageDns  — DNS denetimi bu alan adının kayıtlarını bekler/yayımlar
+ *
+ * `manageDns: false`, DNS'i başka bir yerden yönetilen bir alan adını denetim
+ * gürültüsünden çıkarır; posta işlevini değiştirmez.
+ */
 function parseDomains() {
   const fromFile = FILE_CFG.mail && Array.isArray(FILE_CFG.mail.domains) ? FILE_CFG.mail.domains : null;
-  const raw = fromFile || [
-    { name: PRIMARY_DOMAIN, dkimSelector: lower(pick('FITFAK_MAIL_DKIM_SELECTOR', 'mail.dkimSelector', 'mail')) },
-    // aybars.net.tr posta ALMIYOR ama gönderiyor (kişisel site bildirimleri,
-    // parola sıfırlama vb.). Bu yüzden MX'i yok, DKIM'i var.
-    { name: lower(pick('FITFAK_SITE_DOMAIN', 'site.domain', 'aybars.net.tr')), dkimSelector: 'mail', receive: false },
-  ];
+  const fromEnv = list('FITFAK_MAIL_DOMAINS', null, []);
+  const raw = fromFile
+    || (fromEnv.length ? fromEnv.map((name) => ({ name })) : null)
+    || [{ name: PRIMARY_DOMAIN, dkimSelector: lower(pick('FITFAK_MAIL_DKIM_SELECTOR', 'mail.dkimSelector', 'mail')) }];
   return raw.map((d) => ({
     name: lower(d.name),
     dkimSelector: lower(d.dkimSelector || 'mail'),
     receive: d.receive !== false,
+    sign: d.sign !== false,
+    manageDns: d.manageDns !== false,
     dmarcRua: lower(d.dmarcRua || `dmarc@${lower(d.name)}`),
   })).filter((d) => d.name);
 }
 
 const DOMAINS = parseDomains();
 const RECEIVE_DOMAINS = DOMAINS.filter((d) => d.receive).map((d) => d.name);
+const DNS_MANAGED_DOMAINS = DOMAINS.filter((d) => d.manageDns);
 
 /* ─────────────────────────────────────────────────────────────
    VHOST'LAR — cloudflared çıkışları
@@ -372,7 +413,9 @@ const DB = {
   driver: lower(pick('FITFAK_MAIL_DB_DRIVER', 'db.driver', 'auto')), // auto | fitfak | file
   dataDir: path.join(DATA_DIR, 'db'),
   identityDir: path.resolve(pick('FITFAK_MAIL_DB_IDENTITY_DIR', 'db.identityDir', path.join(DATA_DIR, 'identity'))),
-  remoteTarget: pick('FITFAK_MAIL_DB_TARGET', 'db.remoteTarget', 'https://localhost:51572'),
+  // Boş bırakmak GÖMÜLÜ motoru seçer; dolu olması uzak (mTLS/gRPC) sunucuyu.
+  // `pickAllowEmpty` olmadan bu seçim yapılamıyordu — açıklaması orada.
+  remoteTarget: pickAllowEmpty('FITFAK_MAIL_DB_TARGET', 'db.remoteTarget', 'https://localhost:51572'),
   serviceName: pick('FITFAK_MAIL_DB_SERVICE_NAME', 'db.serviceName', 'smtp-service'),
   ownerId: pick('FITFAK_MAIL_DB_OWNER_ID', 'db.ownerId', 'fitfak-smtp-service'),
   dbId: pick('FITFAK_MAIL_DB_ID', 'db.dbId', ''),
@@ -540,6 +583,7 @@ const config = {
   primaryDomain: PRIMARY_DOMAIN,
   domains: DOMAINS,
   receiveDomains: RECEIVE_DOMAINS,
+  dnsManagedDomains: DNS_MANAGED_DOMAINS,
   vhosts: VHOSTS,
   webmailOrigin: String(WEBMAIL_ORIGIN).replace(/\/+$/, ''),
   siteOrigin: String(SITE_ORIGIN).replace(/\/+$/, ''),

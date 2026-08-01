@@ -190,6 +190,37 @@ runner.test('blob: yazılır, okunur ve özeti doğrulanır', async () => {
   assert(read.equals(data), 'baytlar birebir olmalı');
 });
 
+runner.test('blob: parça bir `bytes` alanına BUFFER olarak yazılır', async () => {
+  // Bu, uzak (gRPC) sürücüde her eki ve her giden iletiyi okunamaz yapan
+  // hatanın tam olarak yakalandığı yer.
+  //
+  // `blob_chunks.bytes` şemada `bytes` türünde. Motorun JSON kodlayıcısı bu
+  // alana gelen bir DİZGEYİ base64 sanıp çözüyor; parça `b64:AAAA…` biçiminde
+  // bir dizge olarak yazıldığında `:` geçerli bir base64 karakteri olmadığı
+  // için çözüm hem ön eki hem gövdeyi bozuyordu — geri okunduğunda ne ön ek
+  // kalıyordu ne de özgün baytlar.
+  const { encodeChunk } = require('../src/db/blob-store');
+  const slice = Buffer.from('giden iletinin ham gövdesi');
+  const encoded = encodeChunk(slice);
+
+  assert(Buffer.isBuffer(encoded), 'parça Buffer olarak kodlanmalı; dizge, kodlayıcıda base64 çözümüne uğrar');
+  assertEqual(encoded.subarray(0, 4).toString('latin1'), 'b64:', 'kendini tanıtan ön ek baytlarda durmalı');
+
+  // Motorun `bytes` alanı için yaptığı şeyin aynısı: Buffer'a dokunulmaz.
+  // (Dizge olsaydı `Buffer.from(değer, 'base64')` geri dönüşsüz bozardı.)
+  const asStored = Buffer.isBuffer(encoded) ? encoded : Buffer.from(String(encoded), 'base64');
+  assert(asStored.equals(encoded), 'saklanan değer yazılanla birebir olmalı');
+
+  // Ve uzak sürücünün JSON turu: Buffer -> base64 dizge -> Buffer.
+  const overTheWire = asStored.toString('base64');
+  const decodedBack = Buffer.from(overTheWire, 'base64');
+  assertEqual(decodedBack.subarray(0, 4).toString('latin1'), 'b64:', 'ön ek JSON turundan sonra da durmalı');
+  assert(
+    Buffer.from(decodedBack.subarray(4).toString('latin1'), 'base64').equals(slice),
+    'özgün baytlar tur sonunda birebir geri gelmeli',
+  );
+});
+
 runner.test('blob: aynı içerik tekilleştirilir', async () => {
   const data = Buffer.from('aynı içerik');
   const first = await ctx.stores.blobs.write(data, { kind: 'dedupe' });

@@ -38,6 +38,14 @@ class OutboundQueue {
     this.campaignRates = new Map(); // campaignId -> rate limiter
     this.running = false;
     this.ticker = null;
+    this._ticking = null;      // uçuştaki tur (varsa) — bkz. tick()
+    this._tickPending = false; // tur sırasında yeni iş geldi mi?
+    // `deliver()` çağrısına eklenen alanlar (resolver, port, mxOverride,
+    // requireTls). Üretimde boş; uçtan uca teslimat testinin gerçek kuyruk
+    // kodunu, sahte bir MX'e karşı, yerel bir portta çalıştırabilmesi için var
+    // — teslimat yolunu test edebilmenin tek yolu ya bu ya da onu taklit
+    // etmek, ve taklit edilen bir yol test edilmiş sayılmaz.
+    this.deliveryOptions = {};
     this.stats = {
       delivered: 0, deferred: 0, failed: 0, cycles: 0,
       lastCycleAt: 0, inFlight: 0,
@@ -47,10 +55,30 @@ class OutboundQueue {
   /** Kuyruğa iş ekler (depo katmanına yönlendirir). */
   async enqueue(args) {
     const result = await this.stores.outbound.enqueue(args);
-    this.logger.debug({ recipients: result.recipients.length, msg: 'kuyruğa alındı' });
+    this.logger.info({
+      recipients: result.recipients.length,
+      queueIds: result.queued,
+      blobId: result.blobId,
+      envelopeFrom: args.envelopeFrom,
+      running: this.running,
+      msg: 'kuyruğa alındı',
+    });
+    if (!this.running) {
+      // Kuyruk işçisi çalışmıyorken sıraya girmiş bir ileti hiç gönderilmez ve
+      // bunu gösteren tek şey, bir daha asla gelmeyen "teslim edildi" satırı
+      // olurdu. Kayıt satırının kendisi bu durumu söylemeli.
+      this.logger.warn({
+        recipients: result.recipients.length,
+        msg: 'kuyruk işçisi çalışmıyor — ileti sırada bekliyor, işçi başlayana kadar gönderilmeyecek',
+      });
+    }
     // Yeni iş varsa beklemeden bir tur başlat: 5 saniyelik yoklama aralığı,
     // tek bir postayı gönderirken fark edilir bir gecikme demek.
-    if (this.running) setImmediate(() => this.tick().catch(() => {}));
+    if (this.running) {
+      setImmediate(() => this.tick().catch((err) => {
+        this.logger.error({ error: err.message, stack: err.stack, msg: 'kuyruk turu hata verdi' });
+      }));
+    }
     return result;
   }
 
@@ -102,38 +130,111 @@ class OutboundQueue {
     if (until > current) this.domainBackoff.set(domain, until);
   }
 
+  /**
+   * Bir kuyruk turu. TURLAR ÜST ÜSTE BİNMEZ.
+   *
+   * ── NEDEN KİLİT GEREKİYOR ────────────────────────────────────────────────
+   * `claimDue`, satırları önce OKUYUP sonra "sending" olarak İŞARETLİYOR ve bu
+   * iki adım arasında `await` var. İki tur aynı anda çalıştığında ikisi de
+   * satırı "queued" görüyor, ikisi de kilitliyor ve ikisi de teslim ediyor —
+   * alıcı iletiyi İKİ KEZ alıyor. Satır başına kilit bunu engellemiyor, çünkü
+   * kilidin kendisi de aynı yarışın içinde konuyor.
+   *
+   * Ve eşzamanlılık burada istisna değil, olağan hâl: `enqueue()` beklemeden
+   * bir tur başlatıyor, yoklama zamanlayıcısı da kendi turunu çeviriyor. Yeni
+   * bir ileti, zamanlayıcının turuna denk geldiği anda çift teslimat oluyor.
+   *
+   * Turlar arası kilit, çift teslimatı tek süreç içinde tamamen kaldırıyor.
+   * (Birden fazla süreçte satır kilidi hâlâ tek koruma; onun sağlamlaştırılması
+   * motorda karşılaştır-değiştir desteği ister.)
+   */
   async tick() {
     if (!this.running) return;
+    if (this._ticking) {
+      // Zaten dönen bir tur var. Yenisini başlatmak yerine onun bitmesini
+      // bekle; bu arada gelen yeni iş için bir tur daha gerektiğini işaretle.
+      this._tickPending = true;
+      return this._ticking;
+    }
+    this._ticking = this._tickOnce().finally(() => {
+      this._ticking = null;
+      if (this._tickPending && this.running) {
+        this._tickPending = false;
+        // Zincirleme `await` yerine sıradaki döngü adımına bırakılıyor: uzun
+        // bir tur zinciri, çağıranın beklediği sözü süresiz açık tutardı.
+        setImmediate(() => this.tick().catch((err) => {
+          this.logger.error({ error: err.message, msg: 'kuyruk turu hata verdi' });
+        }));
+      }
+    });
+    return this._ticking;
+  }
+
+  async _tickOnce() {
     this.stats.cycles++;
     this.stats.lastCycleAt = Date.now();
 
     const batchSize = this.config.queue.workers * this.config.queue.perDomainConcurrency * 4;
+    // Talep etme adımı ayrı ölçülür. Kuyruğun donduğu bildirildiğinde suçlanan
+    // hep teslimat oluyordu; oysa duran şey bu çağrıydı (giden kuyruğun
+    // `nextAttemptAt` aralık sorgusu, veritabanı tarafında olay döngüsünü
+    // dakikalarca kilitliyordu). Süresi görünür olmadan bu ayrım yapılamaz.
+    const claimStartedAt = Date.now();
     const claimed = await this.stores.outbound.claimDue({
       workerId: this.workerId,
       limit: batchSize,
       lockMs: 300_000,
     });
+    const claimMs = Date.now() - claimStartedAt;
+    if (claimMs > 1000) {
+      this.logger.warn({
+        ms: claimMs, claimed: claimed.length,
+        msg: 'kuyruktan iş alma yavaş — veritabanı sorgusu darboğaz olabilir',
+      });
+    }
     if (!claimed.length) return;
 
+    this.logger.debug({ claimed: claimed.length, ms: claimMs, msg: 'kuyruktan iş alındı' });
+
     const tasks = [];
+    let deferredByBackoff = 0;
     for (const item of claimed) {
       const domain = item.rcptDomain || splitAddress(item.rcptTo).domain;
       if (!this._domainAvailable(domain)) {
         // Bu tur bu alana yer yok: kilidi bırak, sıradaki turda yeniden alınır.
-        await this.stores.outbound.markFailure(item.ref, {
-          error: 'alan adı için eşzamanlılık/geri çekilme penceresi dolu',
-          smtpCode: 0,
-        }).catch(() => {});
+        //
+        // BIRAKMAK, BAŞARISIZ SAYMAK DEĞİL. Burada `markFailure` çağrılıyordu
+        // ve her tur bir deneme harcıyordu; `maxAttempts` dolduğunda ileti
+        // kalıcı olarak başarısız işaretleniyordu — tek bir teslimat denemesi
+        // bile yapılmadan. Geri çekilme penceresi bir teslimat hatası değil.
+        deferredByBackoff++;
+        await this.stores.outbound.release(
+          item.ref, 'alan adı için eşzamanlılık/geri çekilme penceresi dolu',
+        ).catch(() => {});
         continue;
       }
       this._acquireDomain(domain);
       tasks.push(this.limiter(() => this._process(item, domain)));
+    }
+
+    if (deferredByBackoff) {
+      this.logger.debug({
+        held: deferredByBackoff, dispatched: tasks.length,
+        backoffDomains: [...this.domainBackoff.entries()]
+          .filter(([, until]) => until > Date.now()).map(([d]) => d),
+        msg: 'geri çekilme/eşzamanlılık nedeniyle bu tur bekletildi (deneme sayılmadı)',
+      });
     }
     await Promise.allSettled(tasks);
   }
 
   async _process(item, domain) {
     this.stats.inFlight++;
+    // Hata yolundaki kayıt satırları da süreyi bildiriyor, bu yüzden `try`
+    // bloğunun DIŞINDA: blok içinde tanımlanmış bir `const`, `catch` içinden
+    // okunduğunda ReferenceError verir ve gerçek teslimat hatasının üstünü
+    // örterdi.
+    const startedAt = Date.now();
     try {
       if (item.campaignId) {
         const rate = this._campaignRate(item.campaignId);
@@ -150,7 +251,12 @@ class OutboundQueue {
         return;
       }
 
-      const startedAt = Date.now();
+      this.logger.debug({
+        queueId: item.queueId, to: item.rcptTo, domain,
+        attempt: item.attempts + 1, sizeBytes: item.sizeBytes,
+        dkim: item.dkimSigned, smime: item.smimeSigned,
+        msg: 'teslimat başlıyor',
+      });
       const result = await deliver({
         rawMessage: raw,
         envelopeFrom: item.envelopeFrom,
@@ -159,6 +265,7 @@ class OutboundQueue {
         logger: this.logger,
         localAddress: this.config.smtp.outboundLocalAddress || null,
         dsnRequested: item.dsnRequested,
+        ...this.deliveryOptions,
       });
 
       await this.stores.outbound.markSent(item.ref, {
@@ -169,13 +276,22 @@ class OutboundQueue {
           at: Date.now(), mx: result.mx, code: result.code,
           tls: result.tlsUsed, verified: result.tlsVerified,
           durationMs: Date.now() - startedAt,
+          // Aşama süreleri kuyruk satırında da saklanır: teslimat günlerce
+          // sonra incelendiğinde süreç kaydı çoktan dönmüş oluyor.
+          timings: result.timings || null,
+          attempts: (result.attempts || []).length,
         },
       });
       this.stats.delivered++;
       this.logger.info({
+        queueId: item.queueId,
         to: item.rcptTo, mx: result.mx, code: result.code,
+        response: String(result.message || '').slice(0, 120),
         tls: result.tlsUsed ? (result.tlsVerified ? 'doğrulanmış' : 'doğrulanmamış') : 'yok',
+        attempt: item.attempts + 1,
+        triedMx: (result.attempts || []).length,
         ms: Date.now() - startedAt,
+        stages: result.timings || undefined,
         msg: 'teslim edildi',
       });
       // Başarı, alan adının geri çekilmesini temizler.
@@ -187,21 +303,38 @@ class OutboundQueue {
         smtpCode: err.code || 0,
         permanent,
         mx: err.mx || '',
-        logEntry: { at: Date.now(), error: err.message, code: err.code || 0, stage: err.stage || '' },
+        logEntry: {
+          at: Date.now(), error: err.message, code: err.code || 0, stage: err.stage || '',
+          timings: err.timings || null,
+          mxTried: (err.attempts || []).map((a) => ({ mx: a.mx, code: a.code, stage: a.stage, error: a.error })),
+        },
       });
 
       if (permanent) {
         this.stats.failed++;
-        this.logger.warn({ to: item.rcptTo, code: err.code, error: err.message, msg: 'kalıcı teslimat hatası' });
+        this.logger.warn({
+          queueId: item.queueId, to: item.rcptTo, mx: err.mx || '',
+          code: err.code, stage: err.stage || '',
+          triedMx: (err.attempts || []).length,
+          ms: Date.now() - startedAt,
+          error: err.message,
+          msg: 'kalıcı teslimat hatası — bir daha denenmeyecek',
+        });
         await this._maybeSendDsn(item, err);
       } else {
         this.stats.deferred++;
         // Geçici hata: bu alana kısa bir süre yüklenme.
         this._backoffDomain(domain, Math.min(15 * 60_000, 30_000 * Math.max(1, item.attempts + 1)));
         this.logger.info({
-          to: item.rcptTo, attempt: outcome ? outcome.attempts : 0,
+          queueId: item.queueId,
+          to: item.rcptTo, mx: err.mx || '',
+          code: err.code || 0, stage: err.stage || '',
+          attempt: outcome ? outcome.attempts : 0,
+          maxAttempts: this.config.queue.maxAttempts,
           nextAt: outcome && outcome.nextAttemptAt ? new Date(outcome.nextAttemptAt).toISOString() : null,
-          error: err.message, msg: 'teslimat ertelendi',
+          ms: Date.now() - startedAt,
+          error: err.message,
+          msg: 'teslimat ertelendi',
         });
       }
     } finally {

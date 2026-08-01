@@ -124,15 +124,110 @@ class MailSigner {
     }
   }
 
-  /** Yayımlanması gereken DNS kaydı — durum API'si ve DNS denetimi kullanır. */
-  async dkimDnsRecord(domain) {
-    const key = await this.getDkimKey(domain);
-    if (!key) return null;
+  /**
+   * Kasadaki DKIM anahtarına BAKAR — yoksa üretmez.
+   *
+   * `getDkimKey` ile arasındaki fark, "anahtar var mı?" sorusunu sorabilmenin
+   * tek yolu olması. Üreten bir okuma ile bu soru sorulamıyor: çağırmak
+   * cevabı değiştiriyor, ve her çağıran (durum ekranı, DNS denetimi, açılış
+   * denetimi) sırf bakmak isterken yeni bir anahtar yaratmış oluyordu.
+   *
+   * @returns {{present: boolean, unreadable?: boolean, ...}}
+   */
+  async peekDkimKey(domain) {
+    const domainConfig = this.config.domainConfig(domain);
+    if (!domainConfig) return { present: false, reason: 'not-a-local-domain' };
+    const selector = domainConfig.dkimSelector;
+    const name = MailSigner.dkimSecretName(domain, selector);
+
+    let secret = null;
+    try {
+      secret = await this.vault.get('dkim-key', name);
+    } catch (err) {
+      return { present: false, unreadable: true, selector, domain, reason: err.message };
+    }
+    if (!secret) return { present: false, selector, domain, reason: 'vault-empty' };
+
+    const privateKeyPem = secret.value.toString('utf8');
     return {
-      name: `${key.selector}._domainkey.${domain}`,
+      present: true,
+      selector,
+      domain,
+      version: secret.version,
+      privateKeyPem,
+      dnsName: `${selector}._domainkey.${domain}`,
+      dnsValue: dkim.dnsRecordFromPrivateKey(privateKeyPem),
+    };
+  }
+
+  /**
+   * Yayımlanması gereken DNS kaydı — durum API'si ve DNS denetimi kullanır.
+   *
+   * `create` ÖNTANIMLI OLARAK KAPALI. Açık olduğu sürece DNS denetimi, sırf
+   * "beklenen kayıtlar neler" listesini kurarken kasaya yeni bir anahtar
+   * yazıyordu; denetim salt okunur olduğunu söylerken yan etkisi anahtar
+   * üretmekti ve yayımdaki TXT kaydı o anda geçersizleşiyordu.
+   */
+  async dkimDnsRecord(domain, { create = false } = {}) {
+    const key = create ? await this.getDkimKey(domain) : await this.peekDkimKey(domain);
+    if (!key || (!create && !key.present)) return null;
+    const selector = key.selector;
+    return {
+      name: `${selector}._domainkey.${domain}`,
       type: 'TXT',
       value: dkim.dnsRecordFromPrivateKey(key.privateKeyPem),
     };
+  }
+
+  /**
+   * Açılış denetimi: kasadaki anahtar ile YAYINDAKİ TXT kaydı aynı mı?
+   *
+   * Sıra bilerek böyle: ÖNCE kasa, SONRA DNS.
+   *
+   *   - Kasada anahtar yoksa, yayındaki kayıt (varsa) artık bize ait olmayan
+   *     bir anahtarı duyuruyor demektir. O hâlde imzalarımız doğrulanamaz ve
+   *     bunu ilk gönderimde değil, açılışta bilmek gerekir.
+   *   - Kasada anahtar varsa ama DNS başka bir `p=` gösteriyorsa, kayıt eskide
+   *     kalmış demektir (anahtar yenilenmiş, TXT güncellenmemiş). Sonuç aynı:
+   *     giden imzalar doğrulanmaz.
+   *
+   * Hiçbir şey ÜRETMEZ ve hiçbir şey YAZMAZ; yalnızca durumu bildirir.
+   */
+  async verifyDkimPublication(domain, { resolver = null, timeoutMs = 5000 } = {}) {
+    const peek = await this.peekDkimKey(domain);
+    const result = {
+      domain,
+      selector: peek.selector || null,
+      vault: peek.present ? 'present' : (peek.unreadable ? 'unreadable' : 'missing'),
+      dns: 'unknown',
+      match: false,
+      published: [],
+      expected: peek.present ? peek.dnsValue : null,
+    };
+
+    const dnsName = peek.dnsName || `${peek.selector || 'mail'}._domainkey.${domain}`;
+    let published = [];
+    try {
+      const resolveTxt = resolver || require('node:dns').promises.resolveTxt;
+      // Bu denetim AÇILIŞTA çalışıyor. Süre sınırı olmayan bir DNS sorgusu,
+      // çözücü yanıt vermediğinde posta sunucusunun açılışını süresiz
+      // bekletirdi — ve bir bilgi denetimi, hizmetin ayağa kalkmasını
+      // engelleyecek kadar önemli değil.
+      const rows = await withTimeout(resolveTxt(dnsName), timeoutMs, dnsName);
+      published = rows.map((chunks) => (Array.isArray(chunks) ? chunks.join('') : String(chunks)));
+    } catch (err) {
+      result.dns = err.code === 'ENOTFOUND' || err.code === 'ENODATA' ? 'absent' : 'lookup-failed';
+      result.dnsError = err.code || err.message;
+      return result;
+    }
+
+    result.published = published;
+    result.dns = published.length ? 'present' : 'absent';
+    if (peek.present && published.length) {
+      const wanted = publicKeyTag(peek.dnsValue);
+      result.match = published.some((value) => wanted && publicKeyTag(value) === wanted);
+    }
+    return result;
   }
 
   /**
@@ -214,4 +309,37 @@ class MailSigner {
   }
 }
 
-module.exports = { MailSigner };
+/** Bir sözü süre sınırına bağlar; zaman aşımı DNS hatası gibi kodlanır. */
+function withTimeout(promise, ms, label) {
+  if (!(ms > 0)) return promise;
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    // Zamanlayıcı BİLEREK unref edilmiyor. Unref edilmiş bir zamanlayıcı, olay
+    // döngüsünü ayakta tutan başka bir şey yoksa süreci sessizce bitirir: söz
+    // ne çözülür ne reddedilir, çağıran da hiçbir sonuç almaz. Zaman aşımının
+    // güvenilir olması, birkaç saniyelik bir tutamağa değer.
+    timer = setTimeout(() => {
+      const err = new Error(`DNS zaman aşımı (${label}, ${ms}ms)`);
+      err.code = 'ETIMEOUT';
+      reject(err);
+    }, ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
+/**
+ * DKIM TXT kaydından yalnızca `p=` (açık anahtar) değerini çıkarır.
+ *
+ * Karşılaştırma metin olarak yapılamaz: aynı anahtar `v=`, `k=`, `t=` ve
+ * `h=` etiketleri farklı sırayla ya da fazladan boşlukla yayımlanmış
+ * olabilir, ve DNS sağlayıcıları uzun TXT değerlerini parçalara bölüp geri
+ * birleştirirken boşluk ekleyebiliyor. Anlamlı olan tek alan `p=`.
+ */
+function publicKeyTag(record) {
+  const match = /(?:^|;)\s*p\s*=\s*([^;]*)/i.exec(String(record || ''));
+  if (!match) return null;
+  const value = match[1].replace(/\s+/g, '');
+  return value || null;
+}
+
+module.exports = { MailSigner, publicKeyTag };
