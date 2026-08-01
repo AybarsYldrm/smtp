@@ -19,6 +19,7 @@
 const fs = require('node:fs');
 
 const dkim = require('../src/mail/dkim');
+const smime = require('../src/certs/smime');
 const spf = require('../src/mail/spf');
 const dmarc = require('../src/mail/dmarc');
 const { parseMessage } = require('../src/mail/mime-parser');
@@ -31,9 +32,12 @@ if (!argv.length || argv.includes('--help') || argv.includes('-h')) {
     '  --ip <adres>          bağlanan istemcinin IP\'si (SPF için)',
     '  --mail-from <adres>   zarf göndereni (SPF için)',
     '  --helo <ad>           HELO/EHLO adı',
+    '  --ca <dosya>          S/MIME zincirini doğrulamak için güven çıpası (PEM demeti)',
     '  --json                sonucu JSON olarak yaz',
     '',
     'IP verilmezse SPF atlanır; DKIM ve DMARC yine değerlendirilir.',
+    'İleti S/MIME imzalıysa imza her hâlükârda doğrulanır; --ca verilmezse',
+    'yalnızca ZİNCİR doğrulanamaz, imzanın kendisi yine denetlenir.',
     '',
   ].join('\n'));
   process.exit(argv.length ? 0 : 1);
@@ -77,10 +81,25 @@ async function main() {
     ? await dmarc.evaluate({ fromDomain, spf: spfResult, dkim: dkimResult })
     : null;
 
+  // S/MIME: imza DKIM'den bağımsız bir iddia. DKIM "bu ileti bu alan adından
+  // çıktı" der ve aktarımda biter; S/MIME "bu ileti bu KİŞİ tarafından
+  // yazıldı" der ve uçtan uca sürer. İkisinin ayrı raporlanması gerekiyor,
+  // çünkü biri geçip diğeri kalabilir ve sebepleri hiç ilgisizdir.
+  const caPath = option('--ca');
+  let trustedCaPems = [];
+  if (caPath) {
+    try { trustedCaPems = [fs.readFileSync(caPath, 'utf8')]; }
+    catch (err) { process.stderr.write(`[uyarı] güven çıpası okunamadı (${caPath}): ${err.message}\n`); }
+  }
+  const smimeResult = smime.verifyMessageSignature(parsed, {
+    trustedCaPems,
+    expectedAddress: parsed.from.address || null,
+  });
+
   if (asJson) {
     process.stdout.write(`${JSON.stringify({
       from: parsed.from, subject: parsed.subject, messageId: parsed.messageId,
-      spf: spfResult, dkim: dkimResult, dmarc: dmarcResult,
+      spf: spfResult, dkim: dkimResult, dmarc: dmarcResult, smime: smimeResult,
     }, null, 2)}\n`);
     return;
   }
@@ -124,8 +143,47 @@ async function main() {
     out.push(`DMARC  ${paint(YELLOW, 'atlandı')}  ${paint(DIM, 'From alan adı çözümlenemedi')}`);
   }
 
+  out.push(smimeLines(smimeResult, trustedCaPems.length > 0).join('\n'));
+
   out.push('');
   process.stdout.write(`${out.join('\n')}\n`);
+}
+
+/** S/MIME bölümü. `none` bir hata değil: iletilerin çoğu imzasızdır. */
+function smimeLines(result, haveTrustAnchor) {
+  const lines = [];
+  if (!result || result.status === 'none') {
+    lines.push(`S/MIME ${paint(DIM, 'yok')}     ${paint(DIM, 'ileti S/MIME imzalı değil')}`);
+    return lines;
+  }
+
+  // Durum, "imza matematiksel olarak doğru mu" ile "bu imzaya güvenilir mi"
+  // sorularını AYIRIYOR. İkisini tek bir pass/fail'e indirgemek, kendi
+  // ürettiğimiz geçerli bir imzayı, yalnızca zinciri elimizde olmadığı için
+  // başarısız göstermek olurdu.
+  const label = {
+    'signed-valid': paint(GREEN, 'pass'),
+    'signed-untrusted': paint(YELLOW, 'güvenilmez'),
+    'signed-address-mismatch': paint(RED, 'adres uyuşmaz'),
+    'signed-expired': paint(YELLOW, 'süresi dolmuş'),
+    'signed-invalid': paint(RED, 'fail'),
+  }[result.status] || paint(RED, result.status);
+
+  lines.push(`S/MIME ${label}  ${paint(DIM, `imza=${result.valid ? 'geçerli' : 'geçersiz'} özet=${result.digestMatch ? 'uyuşuyor' : 'uyuşmuyor'}`)}`);
+  if (result.reason) lines.push(`       ${paint(DIM, result.reason)}`);
+
+  const signer = result.signer;
+  if (signer) {
+    lines.push(`       ${paint(DIM, `imzalayan=${signer.subject}`)}`);
+    lines.push(`       ${paint(DIM, `veren=${signer.issuer}`)}`);
+    lines.push(`       ${paint(DIM, `seri=${signer.serialNumber} anahtar=${signer.keyType}`)}`);
+    lines.push(`       ${paint(DIM, `adres=${[...new Set(signer.emails)].join(', ') || '—'} eşleşme=${result.addressMatch === null ? '—' : (result.addressMatch ? 'evet' : 'HAYIR')}`)}`);
+    lines.push(`       ${paint(DIM, `geçerlilik=${new Date(signer.notBefore).toISOString().slice(0, 10)} → ${new Date(signer.notAfter).toISOString().slice(0, 10)} (${result.timeValid ? 'süresi içinde' : 'SÜRESİ DIŞINDA'})`)}`);
+  }
+  lines.push(`       ${paint(DIM, haveTrustAnchor
+    ? `zincir=${result.chainTrusted ? 'doğrulandı' : 'DOĞRULANAMADI'} (ekli sertifika: ${result.certs.length})`
+    : `zincir=denetlenmedi — güven çıpası verilmedi (--ca ile kök/ara sertifikayı verin), ekli sertifika: ${result.certs.length}`)}`);
+  return lines;
 }
 
 main().catch((err) => {

@@ -48,10 +48,25 @@ const DIGEST_OIDS = {
 };
 const DIGEST_BY_OID = Object.fromEntries(Object.entries(DIGEST_OIDS).map(([k, v]) => [v, k]));
 
+/**
+ * SignerInfo.signatureAlgorithm için tanınan OID'ler.
+ *
+ * `hash: null` "özeti buradan okuma, `digestAlgorithm` alanından al" demek —
+ * ve bu, kaçınılabilir bir uyumsuzluğun kaynağıydı: OpenSSL (ve onu kullanan
+ * pek çok istemci) RSA imzalarında signatureAlgorithm olarak
+ * `sha256WithRSAEncryption` DEĞİL, düz `rsaEncryption` (1.2.840.113549.1.1.1)
+ * yazıyor; özet zaten ayrı alanda bildiriliyor. Bu OID listede olmadığı için
+ * gelen S/MIME imzaları "bilinmeyen imza algoritması" ile reddediliyordu —
+ * yani dışarıdan gelen imzaların büyük kısmı hiç doğrulanamıyordu.
+ *
+ * Aynı gerekçe EC tarafında `id-ecPublicKey` için de geçerli.
+ */
 const SIGNATURE_ALG_BY_OID = {
+  '1.2.840.113549.1.1.1': { keyType: 'rsa', hash: null },   // rsaEncryption (OpenSSL öntanımlısı)
   '1.2.840.113549.1.1.11': { keyType: 'rsa', hash: 'sha256' },
   '1.2.840.113549.1.1.12': { keyType: 'rsa', hash: 'sha384' },
   '1.2.840.113549.1.1.13': { keyType: 'rsa', hash: 'sha512' },
+  '1.2.840.10045.2.1': { keyType: 'ec', hash: null },       // id-ecPublicKey
   '1.2.840.10045.4.3.2': { keyType: 'ec', hash: 'sha256' },
   '1.2.840.10045.4.3.3': { keyType: 'ec', hash: 'sha384' },
   '1.2.840.10045.4.3.4': { keyType: 'ec', hash: 'sha512' },
@@ -60,7 +75,43 @@ const SIGNATURE_ALG_BY_OID = {
 
 const CURVE_FOR_HASH = { sha256: 'P-256', sha384: 'P-384', sha512: 'P-521' };
 
-function asn1() { return require('@fitfak/ssl/src/asn1'); }
+/**
+ * ASN.1 ilkelleri.
+ *
+ * ÜRETME tarafı @fitfak/ssl'i gerektiriyor (sertifika profilleri, OID kayıt
+ * defteri). DOĞRULAMA tarafı gerektirmiyor: yaptığı tek şey DER okumak ve
+ * Node'un kendi `crypto.verify`'ını çağırmak — ikisi de burada zaten var
+ * (`./asn1`).
+ *
+ * Buna rağmen doğrulama da aynı `require` üzerinden gidiyordu, yani
+ * @fitfak/ssl kurulu değilken gelen bir S/MIME imzasını DOĞRULAMAK da
+ * imkânsızdı. İmza doğrulamak, imza üretmekten farklı bir yetenek ve daha az
+ * şey gerektiriyor; eksik bir paket yüzünden kapanmamalı.
+ */
+function asn1() {
+  try { return require('@fitfak/ssl/src/asn1'); }
+  catch { return require('./asn1'); }
+}
+
+/**
+ * Bir düğümün TAM TLV baytları (etiket + uzunluk + içerik).
+ *
+ * İki ASN.1 uygulaması bunu farklı veriyor: @fitfak/ssl `contentOff` ile
+ * konumu bildiriyor, buradaki `readChildren` ise dilimi `raw` olarak hazır
+ * veriyor. Fark gözetilmezse biri `undefined - number = NaN` üretir ve
+ * `subarray(NaN, NaN)` sessizce BOŞ bir tampon döndürür — imzalayan
+ * sertifikası "ekli değil" görünür.
+ */
+function fullTlv(node, parentContent) {
+  if (node.raw) return node.raw;
+  const start = node.contentOff - node.headerLen;
+  return parentContent.subarray(start, start + node.totalLen);
+}
+
+/** İçerik uzunluğu — `len` (@fitfak/ssl) ya da `length` (yerel). */
+function nodeLength(node) {
+  return node.len != null ? node.len : node.length;
+}
 
 function pemToDer(pem, label = 'CERTIFICATE') {
   const rx = new RegExp(`-----BEGIN [^-]*${label}[^-]*-----([\\s\\S]*?)-----END [^-]*${label}[^-]*-----`);
@@ -89,9 +140,8 @@ function parseIssuerAndSerial(certDer) {
   const i = children[0].tag === 0xa0 ? 1 : 0;
   const serialNode = children[i];
   const issuerNode = children[i + 2];
-  const start = issuerNode.contentOff - issuerNode.headerLen;
   return {
-    issuerDer: tbs.content.subarray(start, start + issuerNode.totalLen),
+    issuerDer: fullTlv(issuerNode, tbs.content),
     serialContent: serialNode.content,
   };
 }
@@ -343,10 +393,9 @@ function verifyDetached({ content, signatureDer, trustedCaPems = [], expectedAdd
   }
   if (!signerInfosNode) { result.reason = 'signerInfos yok'; return result; }
 
-  const certDers = certsNode ? readChildren(certsNode.content).map((n) => {
-    const start = n.contentOff - n.headerLen;
-    return certsNode.content.subarray(start, start + n.totalLen);
-  }) : [];
+  const certDers = certsNode
+    ? readChildren(certsNode.content).map((n) => fullTlv(n, certsNode.content))
+    : [];
 
   const certs = [];
   for (const der of certDers) {
@@ -383,8 +432,7 @@ function verifyDetached({ content, signatureDer, trustedCaPems = [], expectedAdd
     const sidChildren = readChildren(sid.content);
     const wantIssuer = sidChildren[0];
     const wantSerial = sidChildren[1];
-    const issuerStart = wantIssuer.contentOff - wantIssuer.headerLen;
-    const wantIssuerDer = sid.content.subarray(issuerStart, issuerStart + wantIssuer.totalLen);
+    const wantIssuerDer = fullTlv(wantIssuer, sid.content);
 
     const match = certs.find((c) => {
       try {
@@ -400,7 +448,7 @@ function verifyDetached({ content, signatureDer, trustedCaPems = [], expectedAdd
     let signedBytes;
     if (signedAttrsNode) {
       // İmza AÇIK SET OF etiketiyle hesaplanır; kayıtta [0] IMPLICIT durur.
-      signedBytes = Buffer.concat([Buffer.from([0x31]), encodeLength(signedAttrsNode.len), signedAttrsNode.content]);
+      signedBytes = Buffer.concat([Buffer.from([0x31]), encodeLength(nodeLength(signedAttrsNode)), signedAttrsNode.content]);
       // messageDigest özniteliği içerikle uyuşmalı: imza doğru olsa bile
       // özet başka bir içeriğe aitse imza bu iletiyi kanıtlamaz.
       const attrs = readChildren(signedAttrsNode.content);
@@ -422,7 +470,10 @@ function verifyDetached({ content, signatureDer, trustedCaPems = [], expectedAdd
       const sigBytes = sigNode.content;
       if (sigSpec.keyType === 'ed25519') cryptoOk = crypto.verify(null, signedBytes, publicKey, sigBytes);
       else {
-        cryptoOk = crypto.verify(sigSpec.hash, signedBytes, {
+        // signatureAlgorithm özeti bildirmiyorsa (rsaEncryption /
+        // id-ecPublicKey) özet, digestAlgorithm alanından gelir.
+        const effectiveHash = sigSpec.hash || hash;
+        cryptoOk = crypto.verify(effectiveHash, signedBytes, {
           key: publicKey,
           ...(sigSpec.keyType === 'ec' ? { dsaEncoding: 'der' } : {}),
         }, sigBytes);

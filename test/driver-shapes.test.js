@@ -335,7 +335,15 @@ runner.test('DKIM: Gmail biçimindeki katlanmış imza doğrulanır', async () =
   const parts = [];
   for (const name of flatNames) {
     const list = remaining.get(name);
-    parts.push(!list || !list.length ? `${name}:` : dkim.canonicalizeHeaderRelaxed(list.shift().raw));
+    // RFC 6376 §3.5: h= listesinde olup iletide karşılığı KALMAYAN ad hiçbir
+    // şey katmaz — ne ad, ne iki nokta, ne satır sonu.
+    //
+    // Burada eskiden `${name}:` yazılıyordu, yani bu test "Gmail imzasını
+    // doğrulayabiliyor muyuz" diye sorarken imzayı BİZİM hatalı kuralımızla
+    // üretiyordu. Kendi hatasını doğrulayan bir test, ve tam olarak bu yüzden
+    // gerçek Gmail iletileri `dkim=fail` alırken paket yeşil kalıyordu.
+    if (!list || !list.length) continue;
+    parts.push(dkim.canonicalizeHeaderRelaxed(list.shift().raw));
   }
   parts.push(dkim.canonicalizeHeaderRelaxed(`DKIM-Signature: ${tags}`));
   const signature = crypto

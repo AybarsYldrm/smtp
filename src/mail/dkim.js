@@ -211,9 +211,20 @@ function signMessage({
   for (const name of hList) {
     const list = remaining.get(name);
     if (!list || !list.length) {
-      // Listede olup iletide olmayan başlık: boş olarak kanonikleşir. Bu,
-      // oversigning'in çalışma biçimi.
-      signedParts.push(headerCanon === 'simple' ? '' : `${name}:`);
+      // Listede olup iletide OLMAYAN başlık HİÇBİR ŞEY katmaz — ne ad, ne
+      // iki nokta, ne de satır sonu (RFC 6376 §3.5: "treated as the null
+      // input, including the header field name, the separating colon, the
+      // header field value, and any CRLF terminator").
+      //
+      // Buraya `${name}:` koymak, imzalanan girdiye GERÇEK bir satır ekliyordu
+      // ve etkisi tam olarak şuydu: oversign edilmiş `h=…:from` listesinde
+      // ikinci `from` için fazladan bir `from:` satırı hesaplanıyor, imza 567
+      // bayt üzerinden atılıyordu. Doğru uygulama (Gmail) aynı iletiden 560
+      // bayt hesaplıyor ve imza tutmuyor: `dkim=fail`.
+      //
+      // Kendi doğrulayıcımız aynı hatayı yaptığı için "bizde pass, Gmail'de
+      // fail" çelişkisi ortaya çıkıyordu — iki taraf da kendi içinde tutarlı,
+      // ikisi de standarda göre yanlıştı.
       continue;
     }
     signedParts.push(canonHeader(list.shift().raw));
@@ -478,7 +489,14 @@ async function verifyMessage(rawMessage, {
       const parts = [];
       for (const name of hNames) {
         const list = remaining.get(name);
-        if (!list || !list.length) { parts.push(headerCanon === 'simple' ? '' : `${name}:`); continue; }
+        // İmzalayan tarafla aynı kural: yok olan başlık HİÇBİR ŞEY katmaz
+        // (RFC 6376 §3.5). Bu satır, gelen postada `dkim=fail` üreten şeydi:
+        // Gmail `h=…:from:to:cc:…:reply-to:…` gibi listeler yayımlıyor ve o
+        // listedeki `cc`/`reply-to` çoğu iletide YOK, tekrarlanan `from`/`to`
+        // ise ikinci kez yok sayılmalı. Her biri için buraya bir `cc:` /
+        // `reply-to:` / `from:` satırı eklemek, imzalayanın hesaplamadığı bir
+        // girdi üretiyor ve geçerli imzalar reddediliyordu.
+        if (!list || !list.length) continue;
         parts.push(canonHeader(list.shift().raw));
       }
       // Doğrulanan DKIM-Signature'ın kendisi, b= değeri boşaltılmış hâlde.
