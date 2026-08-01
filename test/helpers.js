@@ -48,6 +48,7 @@ function freePort() {
  */
 async function createContext({
   smtp = false, domains = null, inboundChecks = false, enforceDmarc = false,
+  driver = 'file', liveQueue = false,
 } = {}) {
   const dir = await makeTempDir();
 
@@ -57,7 +58,11 @@ async function createContext({
     NODE_ENV: 'test',
     FITFAK_MAIL_DATA_DIR: dir,
     FITFAK_MAIL_CERT_DIR: path.join(dir, 'certs'),
-    FITFAK_MAIL_DB_DRIVER: 'file',
+    FITFAK_MAIL_DB_DRIVER: driver,
+    // `db.remoteTarget` öntanımlı olarak DOLU (https://localhost:51572), yani
+    // `fitfak` sürücüsü boş bırakılırsa uzak/mTLS yolunu seçer. Test gömülü
+    // motoru istiyor: hedefi açıkça boşaltmak, bu seçimi yapmanın tek yolu.
+    FITFAK_MAIL_DB_TARGET: '',
     FITFAK_MAIL_VAULT_SECRET: crypto.randomBytes(32).toString('base64'),
     FITFAK_MAIL_DB_ROOT_SECRET: crypto.randomBytes(32).toString('base64'),
     FITFAK_MAIL_PUBLIC_IP: '203.0.113.10',
@@ -87,10 +92,24 @@ async function createContext({
 
   const config = require('../src/config');
   if (domains) {
+    // Alanlar `parseDomains()`in ürettiği biçime tamamlanır: eksik bir
+    // `sign`/`manageDns`, üretimde öntanımlı olan davranışı testte
+    // `undefined` yapardı ve test, gerçekte olmayan bir yapılandırmayı
+    // doğrulamış olurdu.
+    const normalized = domains.map((d) => ({
+      sign: true,
+      manageDns: true,
+      receive: true,
+      dkimSelector: 'mail',
+      dmarcRua: `dmarc@${d.name}`,
+      ...d,
+    }));
     config.domains.length = 0;
-    config.domains.push(...domains);
+    config.domains.push(...normalized);
     config.receiveDomains.length = 0;
-    config.receiveDomains.push(...domains.filter((d) => d.receive !== false).map((d) => d.name));
+    config.receiveDomains.push(...normalized.filter((d) => d.receive !== false).map((d) => d.name));
+    config.dnsManagedDomains.length = 0;
+    config.dnsManagedDomains.push(...normalized.filter((d) => d.manageDns !== false));
   }
 
   const log = require('../src/util/log');
@@ -114,10 +133,23 @@ async function createContext({
   const realtimeEvents = [];
 
   const queue = new OutboundQueue({ config, logger, stores, signer });
-  // Gerçek teslimat yapılmaz: test ortamı dışa posta göndermemeli. Kuyruğa
-  // yazılanlar burada toplanır.
-  queue.start = () => queue;
-  queue.tick = async () => {};
+  if (liveQueue) {
+    // `tick()` ilk satırında `if (!this.running) return` diyor, bu yüzden
+    // bayrak kalkmadan elle çevrilen turlar sessizce hiçbir şey yapmaz —
+    // ve testler "hata yok" diye geçerdi. `start()` çağrılmıyor: o, kendi
+    // zamanlayıcısını kuruyor ve testin elle çevirdiği turlarla yarışıyor.
+    queue.running = true;
+  } else {
+    // Gerçek teslimat yapılmaz: test ortamı dışa posta göndermemeli. Kuyruğa
+    // yazılanlar burada toplanır.
+    //
+    // `liveQueue: true` bu kısıtlamayı kaldırır ve GERÇEK kuyruk turunu
+    // çalıştırır. Dışarıya çıkmaması, teslimatın yerel bir sahte MX'e
+    // yönlendirilmesiyle sağlanır (`queue.deliveryOptions`), motoru taklit
+    // ederek değil.
+    queue.start = () => queue;
+    queue.tick = async () => {};
+  }
 
   const pipeline = new MailPipeline({
     config, logger, stores, signer, queue,

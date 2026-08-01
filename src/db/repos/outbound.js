@@ -174,6 +174,35 @@ class OutboundRepo {
     return claimed;
   }
 
+  /**
+   * Kilidi bırakır ve satırı yeniden alınabilir hâle getirir — DENEME SAYMADAN.
+   *
+   * Talep edilmiş ama HİÇ DENENMEMİŞ bir satır için gereken şey bu. Eskiden
+   * bu durumda `markFailure` çağrılıyordu ve sonucu şuydu: bir alan adı geri
+   * çekilme penceresindeyken (ya da eşzamanlılık yuvaları doluyken) o alana
+   * giden her ileti, her turda bir deneme harcıyordu. `maxAttempts` (8)
+   * dolduğunda ileti KALICI OLARAK BAŞARISIZ işaretleniyordu — hiçbir posta
+   * sunucusuna tek bir kez bile bağlanılmamış olmasına rağmen.
+   *
+   * Geri çekilme bir teslimat hatası değil, bir sıraya alma kararı; deneme
+   * sayacı yalnızca gerçekten denenmiş teslimatları saymalı.
+   */
+  async release(ref, reason = '') {
+    const row = await this.queue.get(String(ref));
+    if (!row) return false;
+    if (row.status !== STATUS.SENDING) return false;
+    await this.queue.update(String(ref), {
+      // Hiç denenmediği için `attempts` ve `nextAttemptAt` OLDUĞU GİBİ kalır:
+      // satır bir sonraki turda yeniden talep edilebilir olur.
+      status: Number(row.attempts || 0) > 0 ? STATUS.DEFERRED : STATUS.QUEUED,
+      lockedBy: '',
+      lockedUntil: 0,
+      lastError: String(reason || '').slice(0, 500),
+      updatedAt: Date.now(),
+    });
+    return true;
+  }
+
   async markSent(ref, { mx = '', tlsUsed = false, smtpCode = 250, logEntry = null }) {
     const row = await this.queue.get(String(ref));
     if (!row) return false;

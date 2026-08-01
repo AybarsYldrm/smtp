@@ -223,9 +223,23 @@ async function deliver({
   const { domain } = splitAddress(recipient);
   if (!domain) throw new DeliveryError(`geçersiz alıcı: ${recipient}`, { permanent: true, code: 550 });
 
+  const mxStartedAt = Date.now();
   const exchangers = mxOverride
     ? [{ host: mxOverride, priority: 0 }]
     : await resolveMailExchangers(domain, { resolver, logger });
+
+  // MX çözümlemesinin SONUCU kayda geçer. "Teslim edilemedi" satırının en sık
+  // sorulan devamı "hangi sunucuya bağlanmaya çalıştın" ve cevabı başka
+  // hiçbir yerde yoktu.
+  if (logger) {
+    logger.debug({
+      domain,
+      mx: exchangers.map((m) => `${m.priority} ${m.host}`),
+      implicit: exchangers.some((m) => m.implicit) || undefined,
+      ms: Date.now() - mxStartedAt,
+      msg: 'MX çözümlendi',
+    });
+  }
 
   const attempts = [];
   let lastError = null;
@@ -240,6 +254,7 @@ async function deliver({
       attempt.result = 'sent';
       attempt.code = result.code;
       attempt.tlsUsed = result.tlsUsed;
+      attempt.ms = Date.now() - attempt.startedAt;
       attempts.push(attempt);
       return { ...result, mx: mx.host, attempts };
     } catch (err) {
@@ -247,13 +262,23 @@ async function deliver({
       attempt.error = err.message;
       attempt.code = err.code || 0;
       attempt.permanent = !!err.permanent;
+      attempt.stage = err.stage || '';
+      attempt.ms = Date.now() - attempt.startedAt;
       attempts.push(attempt);
       lastError = err;
+      if (logger) {
+        // Hangi AŞAMADA düştüğü, hatanın kendisi kadar önemli: bağlantı
+        // kurulamaması ile RCPT'nin reddedilmesi tamamen farklı sorunlar.
+        logger.info({
+          mx: mx.host, stage: err.stage || 'bağlantı', code: err.code || 0,
+          permanent: !!err.permanent, ms: attempt.ms, error: err.message,
+          msg: 'MX denemesi başarısız',
+        });
+      }
       // Kalıcı hata (5xx) sıradaki MX'te de aynı olacaktır: aynı alanın
       // ikinci MX'i "böyle kullanıcı yok" kararını değiştirmez. Denemeye
       // devam etmek yalnızca itibar harcar.
       if (err.permanent) break;
-      if (logger) logger.debug({ mx: mx.host, error: err.message, msg: 'MX denemesi başarısız, sıradakine geçiliyor' });
     }
   }
 
@@ -273,10 +298,22 @@ async function deliverToHost({
   // zaman aşımı, `setTimeout(undefined)` ile alakasız bir tür hatasına
   // dönüşüyordu.
   const timeouts = { ...DEFAULT_TIMEOUTS, ...timeoutsInput };
+
+  // Aşama başına süre. Bir teslimatın "takıldığı" söylendiğinde ilk soru
+  // NEREDE takıldığı: bağlantıda mı, TLS el sıkışmasında mı, gövdeyi
+  // yazarken mi. Tek bir toplam süre bunu ayırt ettirmiyor.
+  const timings = {};
+  let stageStartedAt = Date.now();
+  const mark = (stage) => {
+    timings[stage] = Date.now() - stageStartedAt;
+    stageStartedAt = Date.now();
+  };
+
   // 465 örtük TLS ister: el sıkışma bağlantının ilk baytıyla başlar,
   // STARTTLS yoktur. Düz bağlanıp STARTTLS beklemek o portta hiçbir zaman
   // yanıt alamamak demek.
   const plainSocket = await connectSocket({ host, port, timeout: timeouts.connect, localAddress });
+  mark('connect');
   let socket = plainSocket;
   let tlsUsed = false;
   let tlsVerified = false;
@@ -285,6 +322,7 @@ async function deliverToHost({
     socket = upgraded.socket;
     tlsUsed = true;
     tlsVerified = upgraded.verified;
+    mark('tls');
   }
   let conn = new SmtpClientConnection(socket, { timeouts, logger, label: host });
 
@@ -297,6 +335,7 @@ async function deliverToHost({
   try {
     const greeting = await conn.readReply(timeouts.greeting);
     if (!greeting.ok) fail(greeting, 'karşılama');
+    mark('greeting');
 
     let ehlo = await conn.command(`EHLO ${heloName}`);
     if (!ehlo.ok) {
@@ -307,6 +346,7 @@ async function deliverToHost({
     }
 
     let capabilities = parseCapabilities(ehlo.lines);
+    mark('ehlo');
 
     if (!tlsUsed && capabilities.has('STARTTLS')) {
       const starttls = await conn.command('STARTTLS');
@@ -323,6 +363,7 @@ async function deliverToHost({
         const ehlo2 = await conn.command(`EHLO ${heloName}`);
         if (!ehlo2.ok) fail(ehlo2, 'TLS sonrası EHLO');
         capabilities = parseCapabilities(ehlo2.lines);
+        mark('starttls');
       } else if (requireTls) {
         fail(starttls, 'STARTTLS');
       }
@@ -367,16 +408,19 @@ async function deliverToHost({
 
     const mail = await conn.command(`MAIL FROM:<${envelopeFrom}>${mailParams.length ? ` ${mailParams.join(' ')}` : ''}`);
     if (!mail.ok) fail(mail, 'MAIL FROM');
+    mark('mailFrom');
 
     const rcptParams = dsnRequested && capabilities.has('DSN') ? ' NOTIFY=FAILURE,DELAY' : '';
     const rcpt = await conn.command(`RCPT TO:<${recipient}>${rcptParams}`);
     if (!rcpt.ok) fail(rcpt, 'RCPT TO');
+    mark('rcptTo');
 
     const dataReply = await conn.command('DATA');
     if (dataReply.code !== 354) fail(dataReply, 'DATA');
 
     const accepted = await conn.sendData(rawMessage, timeouts.data);
     if (!accepted.ok) fail(accepted, 'ileti gövdesi');
+    mark('data');
 
     // QUIT yanıtı beklenir ama sonucu teslimatı etkilemez: sunucu 250 dedikten
     // sonra ileti kabul edilmiştir, QUIT'te kopan bağlantı bunu geri almaz.
@@ -388,7 +432,15 @@ async function deliverToHost({
       enhanced: accepted.enhanced,
       tlsUsed,
       tlsVerified,
+      timings,
     };
+  } catch (err) {
+    // Hangi aşamaya kadar gelindiği, hatanın üstüne yazılır: bir zaman aşımı
+    // "bağlantı 30 sn sürdü" ile "gövde 300 sn sürdü" arasında ayrım
+    // yapılamadan okunamıyor.
+    err.timings = timings;
+    if (!err.mx) err.mx = host;
+    throw err;
   } finally {
     conn.close();
   }

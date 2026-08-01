@@ -68,13 +68,7 @@ class MailApplication {
     });
     this.components.signer = signer;
 
-    // DKIM anahtarları açılışta hazırlanır: ilk giden postanın imzasız
-    // gitmemesi için.
-    for (const domain of config.domains) {
-      await signer.getDkimKey(domain.name).catch((err) => {
-        this.logger.error({ domain: domain.name, error: err.message, msg: 'DKIM anahtarı hazırlanamadı' });
-      });
-    }
+    await this._prepareDkimKeys(signer);
 
     /* ── kimlik sağlayıcı ────────────────────────────────────── */
     const { IdpClient } = require('./auth/idp-client');
@@ -219,6 +213,112 @@ class MailApplication {
       msg: 'sunucu hazır',
     });
     return this;
+  }
+
+  /**
+   * Açılışta DKIM anahtarları: ÖNCE KASA, SONRA DNS.
+   *
+   * Sıra bilerek böyle ve eskisi tersiydi. Açılış her alan adı için doğrudan
+   * `getDkimKey` çağırıyordu; o çağrı anahtar yoksa sessizce YENİSİNİ ÜRETİYOR
+   * ve bir uyarı satırı yazıp geçiyordu. İki sonucu vardı:
+   *
+   *   1. "Anahtar var mıydı?" sorusu bir daha sorulamıyordu — açılış, cevabı
+   *      değiştirmiş oluyordu.
+   *   2. Kasa boşsa (yeni kurulum, geri yüklenmemiş yedek, değişmiş kasa
+   *      sırrı) yayındaki TXT kaydı hâlâ ESKİ anahtarı duyuruyordu. Yeni
+   *      anahtarla imzalanan her posta, eski açık anahtarla doğrulanmaya
+   *      çalışılıp başarısız oluyordu — ve bu, "postalarım spam'e düşüyor"
+   *      olarak, günler sonra fark ediliyordu.
+   *
+   * Şimdi: kasaya BAKILIR (üretmeden), sonra yayındaki kayıtla karşılaştırılır.
+   * Anahtar gerçekten yoksa üretilir, ama bu artık sessiz bir yan etki değil
+   * açıkça bildirilen bir olay — ve yayımlanması gereken TXT kaydı, ne
+   * yapılması gerektiğiyle birlikte kayda yazılır.
+   */
+  async _prepareDkimKeys(signer) {
+    const config = this.config;
+    const summary = [];
+
+    for (const domain of config.domains) {
+      if (domain.sign === false) continue;
+      const name = domain.name;
+
+      let state;
+      try {
+        state = await signer.peekDkimKey(name);
+      } catch (err) {
+        this.logger.error({ domain: name, error: err.message, msg: 'kasa okunamadı — DKIM durumu bilinmiyor' });
+        continue;
+      }
+
+      if (!state.present) {
+        // Anahtar yok. Yayında bir kayıt VAR MI diye bakmak, "yeni kurulum" ile
+        // "kasa kayıp" arasındaki farkı gösteren tek şey.
+        const check = await signer.verifyDkimPublication(name).catch(() => null);
+        const stale = check && check.dns === 'present';
+
+        this.logger[stale ? 'error' : 'warn']({
+          domain: name,
+          selector: state.selector,
+          vault: state.unreadable ? 'açılamıyor' : 'boş',
+          dns: check ? check.dns : 'bilinmiyor',
+          msg: stale
+            ? 'kasada DKIM anahtarı YOK ama DNS\'te bir kayıt YAYINDA — o kayıt artık elimizde '
+              + 'olmayan bir anahtarı duyuruyor; yeni anahtar üretilecek ve TXT kaydı GÜNCELLENMELİ'
+            : 'kasada DKIM anahtarı yok — ilk kez üretiliyor',
+        });
+
+        try {
+          const created = await signer.getDkimKey(name);
+          summary.push({ domain: name, selector: created.selector, state: stale ? 'yenilendi-dns-eski' : 'üretildi' });
+        } catch (err) {
+          this.logger.error({ domain: name, error: err.message, msg: 'DKIM anahtarı üretilemedi' });
+          summary.push({ domain: name, state: 'üretilemedi' });
+        }
+        continue;
+      }
+
+      // Anahtar kasada. Yayındaki kayıt bunu mu gösteriyor?
+      const check = await signer.verifyDkimPublication(name).catch((err) => ({
+        dns: 'lookup-failed', dnsError: err.message, match: false,
+      }));
+
+      if (check.match) {
+        this.logger.info({
+          domain: name, selector: state.selector, version: state.version,
+          msg: 'DKIM anahtarı kasada ve yayındaki kayıtla aynı',
+        });
+        summary.push({ domain: name, selector: state.selector, state: 'hizalı' });
+      } else if (check.dns === 'present') {
+        this.logger.error({
+          domain: name,
+          selector: state.selector,
+          dnsName: state.dnsName,
+          expected: state.dnsValue,
+          published: check.published,
+          msg: 'DNS\'teki DKIM kaydı kasadaki anahtarla UYUŞMUYOR — giden imzalar doğrulanmayacak, '
+            + 'TXT kaydı yukarıdaki `expected` değeriyle güncellenmeli',
+        });
+        summary.push({ domain: name, selector: state.selector, state: 'dns-uyuşmuyor' });
+      } else if (check.dns === 'absent') {
+        this.logger.warn({
+          domain: name,
+          dnsName: state.dnsName,
+          expected: state.dnsValue,
+          msg: 'DKIM anahtarı kasada ama DNS\'te kayıt YOK — yayımlanana kadar imzalar doğrulanamaz',
+        });
+        summary.push({ domain: name, selector: state.selector, state: 'dns-eksik' });
+      } else {
+        this.logger.warn({
+          domain: name, dnsError: check.dnsError,
+          msg: 'DKIM kaydı sorgulanamadı — kasadaki anahtar geçerli, yayın durumu bilinmiyor',
+        });
+        summary.push({ domain: name, selector: state.selector, state: 'dns-sorgulanamadı' });
+      }
+    }
+
+    this.logger.info({ domains: summary, msg: 'DKIM durumu' });
+    return summary;
   }
 
   /**

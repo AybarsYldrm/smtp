@@ -36,7 +36,11 @@ class DnsAuditor {
    */
   async expectedRecords() {
     const records = [];
-    for (const domain of this.config.domains) {
+    // Yalnızca DNS'i BURADAN yönetilen alan adları. Bir alan adının posta
+    // alan adı olması, kayıtlarının da bu sunucudan yönetildiği anlamına
+    // gelmiyor; `manageDns: false` olanı denetlemek, düzeltilmesi
+    // istenmeyen bir "eksik kayıt" gürültüsü üretiyordu.
+    for (const domain of (this.config.dnsManagedDomains || this.config.domains)) {
       if (domain.receive) {
         records.push({
           type: 'MX', name: domain.name, domain: domain.name, purpose: 'inbound-mx',
@@ -51,17 +55,24 @@ class DnsAuditor {
         expected: spf, content: spf,
       });
 
-      // DKIM kaydı, kasadaki anahtardan TÜRETİLİR. Anahtar alınamıyorsa bu
-      // sessizce atlanmamalı: DKIM kaydı olmadan giden her imza doğrulanamaz
-      // ve sorun "DNS'te kayıt yok" olarak değil "postam spam'e düşüyor"
-      // olarak fark edilir.
+      // DKIM kaydı, kasadaki anahtardan TÜRETİLİR — ve yalnızca KASADAKİNDEN.
+      //
+      // Burada `create: false` şart. Denetim salt okunur olduğunu söylüyor ama
+      // eskiden beklenen kayıt listesini kurarken `getDkimKey` çağırıyordu ve
+      // o çağrı, kasada anahtar yoksa YENİSİNİ ÜRETİYORDU. Yani denetimin yan
+      // etkisi, o an yayında olan TXT kaydını geçersiz kılmaktı: denetim
+      // "kayıt eski" diyordu, çünkü denetimin kendisi eskitmişti.
+      //
+      // Anahtar yoksa bu bir uyarı, üretme gerekçesi değil: kasada anahtar
+      // olmadan DKIM kaydı yayımlamak da doğrulanamayacak bir kayıt yayımlamak
+      // olurdu.
       let dkim = null;
       try {
-        dkim = await this.signer.dkimDnsRecord(domain.name);
+        dkim = await this.signer.dkimDnsRecord(domain.name, { create: false });
       } catch (err) {
         this.logger.error({
           domain: domain.name, error: err.message,
-          msg: 'DKIM açık anahtarı üretilemedi — bu alan için DKIM kaydı denetlenemiyor',
+          msg: 'DKIM açık anahtarı okunamadı — bu alan için DKIM kaydı denetlenemiyor',
         });
       }
       if (dkim) {
@@ -72,7 +83,9 @@ class DnsAuditor {
       } else {
         this.logger.warn({
           domain: domain.name,
-          msg: 'DKIM kaydı beklenen listeye eklenemedi (anahtar yok)',
+          selector: domain.dkimSelector,
+          msg: 'kasada DKIM anahtarı yok — DKIM kaydı denetlenmiyor; '
+            + 'yayındaki TXT kaydı varsa artık elimizde olmayan bir anahtarı duyuruyor',
         });
       }
 

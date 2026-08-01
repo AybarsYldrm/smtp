@@ -546,6 +546,157 @@ runner.test('statik dosyada yol kaçışı engellenir', async () => {
   assert(!res.text.includes('FITFAK_MAIL_VAULT_SECRET'), 'kaynak sızmamalı');
 });
 
+/* ── .pfx dışa/içe aktarma: uç noktaların kendisi ──────────── */
+
+/**
+ * PKCS#12 sınıfının doğruluğu ayrı bir pakette denetleniyor; burada denetlenen
+ * ŞEY UÇ NOKTA: web arayüzündeki "indir" düğmesi gerçekten kullanıcının verdiği
+ * parolayla şifrelenmiş, istemcilerin açabildiği bir dosya döndürüyor mu, ve
+ * geri yüklenebiliyor mu.
+ */
+function pfxSetup() {
+  const cp = require('node:child_process');
+  const has = cp.spawnSync('openssl', ['version'], { encoding: 'utf8' }).status === 0;
+  return has;
+}
+const HAS_OPENSSL = pfxSetup();
+
+async function seedSmimePair() {
+  const cp = require('node:child_process');
+  const fs = require('node:fs');
+  const os = require('node:os');
+  const path = require('node:path');
+  const { privateKey } = crypto.generateKeyPairSync('rsa', { modulusLength: 2048 });
+  const keyPem = privateKey.export({ type: 'pkcs8', format: 'pem' });
+
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'fitmail-pfx-http-'));
+  const keyFile = path.join(dir, 'k.pem');
+  const certFile = path.join(dir, 'c.pem');
+  fs.writeFileSync(keyFile, keyPem);
+  const res = cp.spawnSync('openssl', [
+    'req', '-x509', '-new', '-key', keyFile, '-out', certFile, '-days', '30',
+    '-subj', '/CN=Fitfak Ag/emailAddress=network@fitfak.net',
+    '-addext', 'subjectAltName=email:network@fitfak.net',
+  ], { encoding: 'utf8' });
+  const certPem = res.status === 0 ? fs.readFileSync(certFile, 'utf8') : null;
+  fs.rmSync(dir, { recursive: true, force: true });
+  if (!certPem) throw new Error(`sertifika üretilemedi: ${res.stderr}`);
+
+  await ctx.stores.certificates.store({
+    usage: 'smime', subjectAddress: 'network@fitfak.net', mailboxRef: mailbox.ref,
+    certPem, privateKeyPem: keyPem, issuedVia: 'test',
+  });
+  return { certPem, keyPem };
+}
+
+runner.test('.pfx dışa aktarma parolasız reddedilir', async () => {
+  const res = await json(`${baseUrl}/api/v1/mailboxes/${mailbox.ref}/certificate/export`, {
+    method: 'POST',
+    headers: { host: 'mail.fitfak.net' },
+    cookie: `${ctx.config.http.sessionCookieName}=${session.sid}`,
+    csrf: session.csrfToken,
+    data: { password: 'kisa' },
+  });
+  assertEqual(res.status, 400, 'kısa parola reddedilmeli');
+  assertEqual(res.json.code, 'PFX_PASSWORD_REQUIRED', 'hata kodu');
+});
+
+runner.test('.pfx dışa aktarma kullanıcının parolasıyla şifrelenmiş dosya döner', async () => {
+  if (!HAS_OPENSSL) return;
+  await seedSmimePair();
+
+  const res = await json(`${baseUrl}/api/v1/mailboxes/${mailbox.ref}/certificate/export`, {
+    method: 'POST',
+    headers: { host: 'mail.fitfak.net' },
+    cookie: `${ctx.config.http.sessionCookieName}=${session.sid}`,
+    csrf: session.csrfToken,
+    data: { password: 'kullanici-parolasi' },
+  });
+
+  assertEqual(res.status, 200, 'dışa aktarma başarılı olmalı');
+  assertMatch(res.headers['content-type'], /pkcs12/, 'içerik türü');
+  assertMatch(res.headers['content-disposition'], /attachment; filename=/, 'ek olarak inmeli');
+  assertEqual(res.headers['cache-control'], 'no-store', 'özel anahtar önbelleğe alınmamalı');
+  assert(res.raw.length > 500, `gövde bir .pfx olmalı (${res.raw.length} bayt)`);
+
+  const { PKCS12 } = require('../src/certs/pkcs12');
+  // DOĞRU parola açar…
+  const parsed = new PKCS12('kullanici-parolasi').parse(res.raw);
+  assertEqual(parsed.macVerified, true, 'bütünlük katmanı doğrulanmalı');
+  assertEqual(parsed.certificates.length, 1, 'sertifika taşınmalı');
+  assertEqual(parsed.privateKeys.length, 1, 'özel anahtar taşınmalı');
+
+  // …yanlış parola açmaz. Şifrelemenin gerçekten KULLANICININ parolasına
+  // bağlı olduğunu gösteren tek denetim bu.
+  let threw = false;
+  try { new PKCS12('yanlis-parola').parse(res.raw); } catch { threw = true; }
+  assert(threw, 'yanlış parolayla açılmamalı');
+});
+
+runner.test('.pfx içe aktarma dosyayı geri yükler', async () => {
+  if (!HAS_OPENSSL) return;
+  const { certPem, keyPem } = await seedSmimePair();
+  const { PKCS12 } = require('../src/certs/pkcs12');
+  const pfx = new PKCS12('geri-yukleme').build(certPem, keyPem, { friendlyName: 'S/MIME' });
+
+  const boundary = '----fitfaktest';
+  const body = Buffer.concat([
+    Buffer.from(`--${boundary}\r\ncontent-disposition: form-data; name="password"\r\n\r\ngeri-yukleme\r\n`, 'utf8'),
+    Buffer.from(`--${boundary}\r\ncontent-disposition: form-data; name="file"; filename="kimlik.pfx"\r\n`
+      + 'content-type: application/x-pkcs12\r\n\r\n', 'utf8'),
+    pfx,
+    Buffer.from(`\r\n--${boundary}--\r\n`, 'utf8'),
+  ]);
+
+  const res = await request(`${baseUrl}/api/v1/mailboxes/${mailbox.ref}/certificate/import`, {
+    method: 'POST',
+    headers: {
+      host: 'mail.fitfak.net',
+      'content-type': `multipart/form-data; boundary=${boundary}`,
+      'content-length': String(body.length),
+      'x-csrf-token': session.csrfToken,
+    },
+    cookie: `${ctx.config.http.sessionCookieName}=${session.sid}`,
+    body,
+  });
+
+  assertEqual(res.status, 200, `içe aktarma başarılı olmalı: ${res.text.slice(0, 200)}`);
+  assertEqual(res.json.ok, true, 'ok bayrağı');
+  assertEqual(res.json.macVerified, true, 'bütünlük katmanı doğrulanmış bildirilmeli');
+  assert(res.json.version > 0, 'yeni bir sürüm saklanmalı');
+});
+
+runner.test('.pfx içe aktarma yanlış parolayı anlaşılır biçimde reddeder', async () => {
+  if (!HAS_OPENSSL) return;
+  const { certPem, keyPem } = await seedSmimePair();
+  const { PKCS12 } = require('../src/certs/pkcs12');
+  const pfx = new PKCS12('dogru-parola').build(certPem, keyPem);
+
+  const boundary = '----fitfaktest2';
+  const body = Buffer.concat([
+    Buffer.from(`--${boundary}\r\ncontent-disposition: form-data; name="password"\r\n\r\nyanlis-parola\r\n`, 'utf8'),
+    Buffer.from(`--${boundary}\r\ncontent-disposition: form-data; name="file"; filename="kimlik.pfx"\r\n`
+      + 'content-type: application/x-pkcs12\r\n\r\n', 'utf8'),
+    pfx,
+    Buffer.from(`\r\n--${boundary}--\r\n`, 'utf8'),
+  ]);
+
+  const res = await request(`${baseUrl}/api/v1/mailboxes/${mailbox.ref}/certificate/import`, {
+    method: 'POST',
+    headers: {
+      host: 'mail.fitfak.net',
+      'content-type': `multipart/form-data; boundary=${boundary}`,
+      'content-length': String(body.length),
+      'x-csrf-token': session.csrfToken,
+    },
+    cookie: `${ctx.config.http.sessionCookieName}=${session.sid}`,
+    body,
+  });
+
+  assertEqual(res.status, 400, 'yanlış parola reddedilmeli');
+  assertEqual(res.json.code, 'PFX_UNREADABLE', 'hata kodu');
+});
+
 (async () => {
   try {
     await setup();
